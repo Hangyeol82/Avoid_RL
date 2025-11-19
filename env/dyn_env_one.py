@@ -6,6 +6,7 @@ from gymnasium import spaces
 from collections import deque
 
 from env.moving_object import MovingObj
+from planning.danger_zone import DangerZoneMap
 from utils_timing import estimate_robot_timeline
 
 
@@ -89,17 +90,27 @@ class DynAvoidOneObjEnv(gym.Env):
         self.dynamic_objs: List[MovingObj] = []
 
         # ----- stuck 상태 추적 -----
-        self.stuck_window = 30
-        self.stuck_route_blocked_min = 8
+        self.stuck_window = 15
         self.stuck_progress_min = 0.05
         self.stuck_eff_min = 0.15
-        self.stuck_move_min_m = 0.04
-        self.stuck_stagnation_radius_cells = 1.2
-        self.stuck_stagnation_steps = 20
-        self.stuck_goal_dist_min_cells = 2.5
+        self.stuck_move_min_m = 0.05
+        self.stuck_stagnation_radius_cells = 1.0
+        self.stuck_stagnation_steps = 15
+        self.stuck_goal_dist_min_cells = 2.0
+        self.stuck_block_min = 0.40
+        self.stuck_score_min = 1.5
         self._stuck_hist = deque(maxlen=self.stuck_window)
         self._stuck_pos_hist = deque(maxlen=self.stuck_stagnation_steps)
         self._stuck_state = False
+        self._prev_stuck_state = False
+
+        self.danger_zone_map = DangerZoneMap(self.grid.shape, decay=0.92, hard_thr=0.6)
+        self.obj_history_len = 25
+        self.obj_histories = {}
+        self.override_path = deque()
+        self.override_target = None
+        self.override_path_full = None
+        self.covered_mask = np.zeros_like(self.grid, dtype=bool)
 
         # ====== 모드 전환 임계(칸 단위) ======
         self.collision_cells = 0.75
@@ -110,18 +121,14 @@ class DynAvoidOneObjEnv(gym.Env):
         self.consider_occlusion_in_obs  = bool(consider_occlusion_in_obs)
         self.consider_occlusion_in_mode = bool(consider_occlusion_in_mode)
 
-        # =========== 경로 방해(Route-Blocked) 모니터 ===========
-        self.goal_radius_m = 0.35
-        self.obj_radius_m  = 0.35
-        self.block_win = 25
-        self.block_rate_thresh = 0.80
-        self.block_future_horizon = 6
-        self.block_future_rate_thresh = 0.7
-        self.rb_block_hist = deque(maxlen=self.block_win)
-        self.rb_future_hist = deque(maxlen=self.block_win)
+        # =========== 경로 방해/정체 모니터 ===========
+        self.block_dyn_radius_cells = 3.5
+        self.block_horizon = 6
+        self.block_route_threshold = 0.65
+        self.block_route_avg_threshold = 0.55
+        self.block_hist = deque(maxlen=25)
 
-        self.rb_win = 20
-        self.rb_hist_vec = deque(maxlen=self.rb_win)
+        self.rb_hist_vec = deque(maxlen=20)
         self.rb_eff_thresh = 0.25
         self.rb_backtrack_thresh = 0.40
         self.rb_prog_ratio_thresh = 0.10
@@ -139,9 +146,10 @@ class DynAvoidOneObjEnv(gym.Env):
         # AVOID/FOLLOW 보상계수
         self.future_pen_coef = 0.07
         self.avoid_base_pen  = -0.2
-        self.follow_step_r   = 0.08
+        self.follow_step_r   = 0.15
         self.delta_dist_coef = 0.15
-        self.progress_coef   = 0.05
+        self.progress_coef   = 0.10
+        self.progress_bonus  = 0.05
 
         # 목표 진행도 캐시
         self._prev_goal_dist_cells = None
@@ -279,6 +287,7 @@ class DynAvoidOneObjEnv(gym.Env):
         new_x = int(x + dx)
         if self._is_free(new_y, new_x):
             self.agent_rc = np.array([new_y, new_x], dtype=float)
+            self.covered_mask[int(new_y), int(new_x)] = True
         if dy == -1 and dx == 0: return 0
         if dy == 0 and dx == -1: return 1
         if dy == 1 and dx == 0: return 2
@@ -293,6 +302,7 @@ class DynAvoidOneObjEnv(gym.Env):
         nx = int(self.agent_rc[1] + dx)
         if self._is_free(ny, nx):
             self.agent_rc = np.array([ny, nx], dtype=float)
+            self.covered_mask[int(ny), int(nx)] = True
             return True
         return False
 
@@ -405,9 +415,160 @@ class DynAvoidOneObjEnv(gym.Env):
             vec = obj.v
         return np.array(vec, dtype=float)
 
+    def _static_density(self, center_rc, radius_cells=3.0):
+        r = int(np.ceil(radius_cells))
+        y0 = max(0, int(np.floor(center_rc[0] - r)))
+        y1 = min(self.H, int(np.ceil(center_rc[0] + r + 1)))
+        x0 = max(0, int(np.floor(center_rc[1] - r)))
+        x1 = min(self.W, int(np.ceil(center_rc[1] + r + 1)))
+        patch = self.grid[y0:y1, x0:x1]
+        if patch.size == 0:
+            return 0.0
+        return float(np.mean(patch == 1))
+
+    def _compute_block_metrics(self, goal_xy_cells):
+        goal_rc = np.array([goal_xy_cells[1], goal_xy_cells[0]], dtype=float)
+        severity_dyn = 0.0
+        if len(self.dynamic_objs) > 0:
+            for obj in self.dynamic_objs:
+                move_vec = self._obj_move_vec_cells(obj)
+                for t in range(0, self.block_horizon + 1):
+                    pred = obj.p + move_vec * t
+                    dist = float(np.linalg.norm(goal_rc - pred))
+                    if dist <= self.block_dyn_radius_cells:
+                        sev = 1.0 - (dist / max(self.block_dyn_radius_cells, 1e-6))
+                        severity_dyn = max(severity_dyn, sev)
+                        break
+        static_density = self._static_density(self.agent_rc, radius_cells=3.0)
+        severity = max(severity_dyn, static_density)
+        return {
+            "severity": severity,
+            "dyn_severity": severity_dyn,
+            "static_density": static_density,
+        }
+
+    def _update_obj_histories(self):
+        self.danger_zone_map.decay_step()
+        active = set()
+        for obj in getattr(self, "dynamic_objs", []):
+            key = id(obj)
+            active.add(key)
+            hist = self.obj_histories.get(key)
+            if hist is None:
+                hist = deque(maxlen=self.obj_history_len)
+                self.obj_histories[key] = hist
+            hist.append(np.array(obj.p, dtype=float))
+        for key in list(self.obj_histories.keys()):
+            if key not in active:
+                del self.obj_histories[key]
+
+    def _follow_override_path(self):
+        if not self.override_path:
+            return None
+        # 제거된 목표 지점 정리
+        while self.override_path:
+            target_xy = self.override_path[0]
+            dist = np.hypot(self.agent_rc[1] - target_xy[0], self.agent_rc[0] - target_xy[1])
+            if dist < 0.3:
+                self.override_path.popleft()
+            else:
+                break
+        if not self.override_path:
+            self.deviated_from_cpp = False
+            self.override_target = None
+            self.override_path_full = None
+            return None
+        target_xy = self.override_path[0]
+        action = self._move_toward(target_xy)
+        if np.hypot(self.agent_rc[1] - target_xy[0], self.agent_rc[0] - target_xy[1]) < 0.3 and self.override_path:
+            self.override_path.popleft()
+        if not self.override_path:
+            self.deviated_from_cpp = False
+            self.override_target = None
+            self.override_path_full = None
+        return action
+
+    def _plan_path_with_mask(self, mask, goal_xy_cells):
+        start = (int(round(self.agent_rc[0])), int(round(self.agent_rc[1])))
+        goal = (int(round(goal_xy_cells[1])), int(round(goal_xy_cells[0])))
+        if not (0 <= goal[0] < self.H and 0 <= goal[1] < self.W):
+            return None
+        mask = mask.copy()
+        mask[start[0], start[1]] = False
+        path_rc = self._bfs_path(start, goal, mask)
+        if not path_rc or len(path_rc) < 2:
+            return None
+        # 경로를 (x,y) 좌표로 저장
+        converted = []
+        for r, c in path_rc[1:]:
+            converted.append((float(c), float(r)))
+        return converted
+
+    def _bfs_path(self, start, goal, mask):
+        if mask[start[0], start[1]]:
+            return None
+        H, W = mask.shape
+        q = deque([start])
+        came = {start: None}
+        while q:
+            r, c = q.popleft()
+            if (r, c) == goal:
+                break
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < H and 0 <= nc < W):
+                    continue
+                if mask[nr, nc]:
+                    continue
+                if (nr, nc) in came:
+                    continue
+                came[(nr, nc)] = (r, c)
+                q.append((nr, nc))
+        if goal not in came:
+            return None
+        path = []
+        cur = goal
+        while cur is not None:
+            path.append(cur)
+            cur = came[cur]
+        path.reverse()
+        return path
+
+    def _handle_stuck(self, goal_xy_cells):
+        goal_rc = np.array([goal_xy_cells[1], goal_xy_cells[0]], dtype=float)
+        for obj in getattr(self, "dynamic_objs", []):
+            if np.linalg.norm(obj.p - goal_rc) <= (self.block_dyn_radius_cells + 1.0):
+                hist = self.obj_histories.get(id(obj))
+                if hist and len(hist) >= 2:
+                    pts = [(float(p[0]), float(p[1])) for p in hist]
+                    self.danger_zone_map.stamp_polyline(pts, radius_cells=1.0, val=0.8)
+                    for y, x in pts:
+                        for dy in range(-2, 3):
+                            for dx in range(-2, 3):
+                                dist = max(abs(dy), abs(dx))
+                                radius = 0.75 if dist <= 1 else 1.0
+                                self.danger_zone_map._stamp_disc(
+                                    self.danger_zone_map.soft,
+                                    y + dy,
+                                    x + dx,
+                                    radius,
+                                    0.8
+                                )
+
+        mask = (self.grid == 1) | self.danger_zone_map.hard | self.covered_mask
+        path = self._plan_path_with_mask(mask, goal_xy_cells)
+        if path:
+            self.override_path = deque(path)
+            self.override_path_full = list(path)
+            target_xy = np.array([path[0][0], path[0][1]], dtype=float)
+            self.override_target = target_xy.copy()
+            if self.wp_idx < len(self.waypoints):
+                self.waypoints[self.wp_idx] = target_xy.copy()
+            self.deviated_from_cpp = True
+
     def _update_stuck_state(self, goal_xy_cells, info):
         metrics = {
-            "route_blocked": 1.0 if info.get("route_blocked", False) else 0.0,
+            "block_level": float(info.get("block_avg", info.get("block_severity", 0.0))),
             "efficiency": float(info.get("efficiency", 0.0)),
             "prog_ratio": float(info.get("prog_ratio", 0.0)),
             "move_mean_m": float(info.get("move_mean_m", 0.0)),
@@ -419,7 +580,7 @@ class DynAvoidOneObjEnv(gym.Env):
             self._stuck_state = False
             return
 
-        route_blocked_steps = sum(1 for h in self._stuck_hist if h["route_blocked"] >= 0.5)
+        block_avg = float(np.mean([h["block_level"] for h in self._stuck_hist]))
         mean_eff = float(np.mean([h["efficiency"] for h in self._stuck_hist]))
         mean_prog = float(np.mean([h["prog_ratio"] for h in self._stuck_hist]))
         mean_move = float(np.mean([h["move_mean_m"] for h in self._stuck_hist]))
@@ -432,11 +593,26 @@ class DynAvoidOneObjEnv(gym.Env):
         goal_dist_cells = float(np.linalg.norm(goal_xy_cells - self.agent_rc))
         far_from_goal = goal_dist_cells >= self.stuck_goal_dist_min_cells
 
+        conds = {
+            "block": block_avg >= self.stuck_block_min,
+            "prog": mean_prog <= self.stuck_progress_min,
+            "eff": mean_eff <= self.stuck_eff_min,
+            "move": mean_move <= self.stuck_move_min_m,
+        }
+        satisfied = sum(1 for v in conds.values() if v)
+
+        def _clip(v):
+            return float(np.clip(v, 0.0, 1.0))
+
+        block_score = _clip((block_avg - self.stuck_block_min) / max(1.0 - self.stuck_block_min, 1e-6))
+        prog_score = _clip((self.stuck_progress_min - mean_prog) / max(self.stuck_progress_min, 1e-6))
+        eff_score = _clip((self.stuck_eff_min - mean_eff) / max(self.stuck_eff_min, 1e-6))
+        move_score = _clip((self.stuck_move_min_m - mean_move) / max(self.stuck_move_min_m, 1e-6))
+        score_sum = block_score + prog_score + eff_score + move_score
+
         self._stuck_state = (
-            route_blocked_steps >= self.stuck_route_blocked_min and
-            mean_prog <= self.stuck_progress_min and
-            mean_eff <= self.stuck_eff_min and
-            mean_move <= self.stuck_move_min_m and
+            satisfied >= 2 and
+            score_sum >= self.stuck_score_min and
             stagnating and
             far_from_goal
         )
@@ -492,12 +668,20 @@ class DynAvoidOneObjEnv(gym.Env):
         self.avoiding          = False
         self.visited           = np.zeros(len(self.waypoints), dtype=bool)
 
-        self.rb_block_hist.clear()
-        self.rb_future_hist.clear()
+        self.block_hist.clear()
         self.rb_hist_vec.clear()
         self._stuck_hist.clear()
         self._stuck_pos_hist.clear()
         self._stuck_state = False
+        self._prev_stuck_state = False
+
+        self.danger_zone_map.clear()
+        self.obj_histories.clear()
+        self.override_path.clear()
+        self.override_target = None
+        self.override_path_full = None
+        self.covered_mask.fill(False)
+        self.covered_mask[int(self.agent_rc[0]), int(self.agent_rc[1])] = True
 
         self._prev_goal_dist_cells = None
 
@@ -601,6 +785,7 @@ class DynAvoidOneObjEnv(gym.Env):
         # 동적 객체 이동
         for obj in getattr(self, "dynamic_objs", []):
             obj.move(self.grid)
+        self._update_obj_histories()
 
         # 객체까지 거리(가림막 고려하여 모드 판단)
         dist_to_obj_m = self._distance_to_nearest_obj_m(visible_only=self.consider_occlusion_in_mode)
@@ -611,13 +796,24 @@ class DynAvoidOneObjEnv(gym.Env):
         SAFE      = self.safe_cells
 
         mode = "AVOID" if dist_to_obj_cells < DANGER else "FOLLOW_CPP"
+        if self.override_path:
+            mode = "FOLLOW_CPP"
         info["mode"] = mode
+        info["override_active"] = bool(self.override_path)
 
         executed_action = 4  # 정지(로깅)
 
         # ---------------- FOLLOW_CPP ----------------
         if mode == "FOLLOW_CPP":
-            if getattr(self, "deviated_from_cpp", False):
+            used_override = False
+            if self.override_path:
+                action_override = self._follow_override_path()
+                if action_override is not None:
+                    executed_action = action_override
+                    reward += self.follow_step_r
+                    used_override = True
+
+            if not used_override and getattr(self, "deviated_from_cpp", False):
                 ry, rx = self.agent_rc
                 curr_xy = np.array([rx, ry], dtype=float)
                 unvisited = np.where(~self.visited)[0]
@@ -629,7 +825,7 @@ class DynAvoidOneObjEnv(gym.Env):
                     self.wp_idx = len(self.waypoints)-1
                 self.deviated_from_cpp = False
 
-            if self.wp_idx < len(self.waypoints):
+            if not used_override and self.wp_idx < len(self.waypoints):
                 executed_action = self._move_toward(self.waypoints[self.wp_idx])
                 reward += self.follow_step_r  # 약간 상향
 
@@ -682,7 +878,10 @@ class DynAvoidOneObjEnv(gym.Env):
             if self._prev_goal_dist_cells is None:
                 self._prev_goal_dist_cells = goal_dist_cells
             prog_delta = self._prev_goal_dist_cells - goal_dist_cells
-            reward += self.progress_coef * float(np.clip(prog_delta, -1.0, 1.0))
+            clipped_delta = float(np.clip(prog_delta, -1.0, 1.0))
+            reward += self.progress_coef * clipped_delta
+            if prog_delta > 1e-6:
+                reward += self.progress_bonus * min(1.0, prog_delta)
             self._prev_goal_dist_cells = goal_dist_cells
 
             # 거의 안 움직였으면 소폭 패널티
@@ -691,61 +890,41 @@ class DynAvoidOneObjEnv(gym.Env):
                 reward -= 0.1
 
             # 대충 막히면 CPP 재동기화 플래그
-            # if self.wp_idx < len(self.waypoints):
-            #     wx, wy = self.waypoints[self.wp_idx]
-            #     ay, ax = self.agent_rc
-            #     cpp_dist_cells = np.hypot(wy - ay, wx - ax)
-            #     if cpp_dist_cells > 3.0:
-            #         self.deviated_from_cpp = True
+            if self.wp_idx < len(self.waypoints):
+                wx, wy = self.waypoints[self.wp_idx]
+                ay, ax = self.agent_rc
+                cpp_dist_cells = np.hypot(wy - ay, wx - ax)
+                if cpp_dist_cells > 3.0:
+                    self.deviated_from_cpp = True
 
         # === 이동 벡터 기록 ===
         dyx = self.agent_rc - self.prev_agent_rc
         self.rb_hist_vec.append(dyx.copy())
         self.prev_agent_rc = self.agent_rc.copy()
 
-        # === 경로 방해(now/future) ===
-        block_now = False
-        block_future = False
-        goal_xy_m = self._goal_xy_m()
-        if len(self.dynamic_objs) > 0 and self.wp_idx < len(self.waypoints):
-            for obj in self.dynamic_objs:
-                obj_xy_m = self._obj_xy_m(obj)
-                move_vec = self._obj_move_vec_cells(obj)
-                if self._circle_overlap(goal_xy_m, self.goal_radius_m, obj_xy_m, self.obj_radius_m):
-                    block_now = True
-                for t in range(1, self.block_future_horizon+1):
-                    fut = obj_xy_m + np.array([self._cells_to_m(move_vec[1]*t),
-                                               self._cells_to_m(move_vec[0]*t)], dtype=float)
-                    if self._circle_overlap(goal_xy_m, self.goal_radius_m, fut, self.obj_radius_m):
-                        block_future = True
-                        break
-
-        self.rb_block_hist.append(1.0 if block_now else 0.0)
-        self.rb_future_hist.append(1.0 if block_future else 0.0)
-        block_rate = float(np.mean(self.rb_block_hist)) if len(self.rb_block_hist) > 0 else 0.0
-        block_future_rate = float(np.mean(self.rb_future_hist)) if len(self.rb_future_hist) > 0 else 0.0
-
-        # 진행 품질 지표
+        # === 경로 방해/정체 지표 ===
         if self.wp_idx < len(self.waypoints):
             goal_xy_cells = self.waypoints[self.wp_idx]
         else:
             goal_xy_cells = self.waypoints[-1]
+
+        block_metrics = self._compute_block_metrics(goal_xy_cells)
+        self.block_hist.append(block_metrics["severity"])
+        block_avg = float(np.mean(self.block_hist)) if len(self.block_hist) > 0 else 0.0
 
         eff, backrate, prog_ratio, idle_ratio, jitter_ratio = self._motion_metrics(goal_xy_cells)
         move_mean_m = 0.0
         if len(self.rb_hist_vec) > 0:
             move_mean_m = float(np.mean(np.linalg.norm(np.array(self.rb_hist_vec), axis=1))) * self.cell_size_m
 
-        osc_score = 0.5 * backrate + 0.3 * idle_ratio + 0.2 * jitter_ratio
-        osc_heavy = (osc_score >= getattr(self, "osc_score_thresh", 0.55))
-        progress_abnormal = (eff <= self.rb_eff_thresh) or (backrate >= self.rb_backtrack_thresh) or (prog_ratio <= self.rb_prog_ratio_thresh)
-        route_blocked = ((block_rate >= self.block_rate_thresh) or (block_future_rate >= self.block_future_rate_thresh)) and progress_abnormal
-
-        info["route_blocked"] = bool(route_blocked)
-        info["block_now"] = bool(block_now)
-        info["block_rate"] = block_rate
-        info["block_future_rate"] = block_future_rate
+        info["block_rate"] = block_avg
+        info["block_future_rate"] = block_metrics["dyn_severity"]
+        info["block_severity"] = block_metrics["severity"]
+        info["block_dyn_severity"] = block_metrics["dyn_severity"]
+        info["block_static_density"] = block_metrics["static_density"]
+        info["block_avg"] = block_avg
         info["move_mean_m"] = move_mean_m
+        goal_xy_m = self._goal_xy_m()
         if len(self.dynamic_objs) > 0:
             d_now = min(np.linalg.norm(self._obj_xy_m(o) - goal_xy_m) for o in self.dynamic_objs)
             info["goal_obj_dist_now_m"] = float(d_now)
@@ -755,7 +934,11 @@ class DynAvoidOneObjEnv(gym.Env):
         info["backtrack_rate"] = backrate
         info["prog_ratio"] = prog_ratio
 
+        prev_stuck = bool(self._stuck_state)
         self._update_stuck_state(np.array(goal_xy_cells, dtype=float), info)
+        if self._stuck_state and not prev_stuck:
+            self._handle_stuck(goal_xy_cells)
+        self._prev_stuck_state = bool(self._stuck_state)
         info["stuck_state"] = bool(self._stuck_state)
 
         # 웨이포인트 처리

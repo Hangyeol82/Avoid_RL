@@ -54,12 +54,11 @@ def create_env(seed=0):
 
     env.dynamic_objs = [blocker]
 
-    # 4) route-blocked 민감도(겹치는데도 rate가 안 오르면 아래를 ↑ 키워)
-    env.rb_win = 12
-    env.rb_obj_frames = 5        # 윈도우 12 중 5프레임 이상 겹치면 충분하다고 봄
-    env.rb_goal_R_m = 1.2        # 목표 원 반경(m)  ← 셀크기 0.2m 기준 약 6칸
-    env.rb_obj_R_m  = 0.8        # 객체 원 반경(m)  ← 약 4칸
-    env.rb_low_motion_m = 0.05   # 평균 이동거리 임계(m)
+    # 4) 막힘 감지 민감도 조정
+    env.block_dyn_radius_cells = 3.0
+    env.block_route_threshold = 0.55
+    env.block_route_avg_threshold = 0.45
+    env.stuck_block_min = 0.45
 
     print("[ENV] test env ready.")
     return env
@@ -135,12 +134,12 @@ def run_episode(env, max_steps=400, render_interval=0.05, seed=0):
         if env.wp_idx < len(env.waypoints):
             gx, gy = env.waypoints[env.wp_idx]
             ax.scatter(gx, gy, c="gold", s=120, marker="*", label="Goal")
-            goal_R_cells = env._m_to_cells(env.rb_goal_R_m)
+            goal_R_cells = getattr(env, "block_dyn_radius_cells", 3.0)
             draw_circle(ax, gx, gy, goal_R_cells, color="gold", alpha=0.6)
 
         # 객체 표시 + 객체 원(반경)
         if hasattr(env, "dynamic_objs"):
-            obj_R_cells = env._m_to_cells(env.rb_obj_R_m)
+            obj_R_cells = getattr(env, "block_dyn_radius_cells", 3.0)
             for i, obj in enumerate(env.dynamic_objs):
                 ax.scatter(obj.p[1], obj.p[0], c="crimson", s=60, label="Obj" if i == 0 else None)
                 draw_circle(ax, obj.p[1], obj.p[0], obj_R_cells, color="crimson", alpha=0.5)
@@ -149,20 +148,16 @@ def run_episode(env, max_steps=400, render_interval=0.05, seed=0):
         ax.scatter(env.agent_rc[1], env.agent_rc[0], c="royalblue", s=70, label="Robot")
 
         # 진단값 표시
-        rb = info.get("rb", {}) or {}
-        route_blocked = bool(info.get("route_blocked", False))
-        window = int(rb.get("window", 0))
-        obj_frames = int(rb.get("obj_frames", 0))
-        avg_move_m = float(rb.get("avg_move_m", 0.0))
-        min_goal_obj = rb.get("min_goal_obj_dist_m", None)
-        blocked_now = bool(rb.get("blocked_now", False))
+        severity = float(info.get("block_severity", 0.0))
+        block_avg = float(info.get("block_avg", 0.0))
+        dyn_sev = float(info.get("block_dyn_severity", 0.0))
+        static_density = float(info.get("block_static_density", 0.0))
+        move_mean = float(info.get("move_mean_m", 0.0))
+        stuck_state = bool(info.get("stuck_state", False))
 
-        rate = obj_frames / max(1, window)
         t1 = (f"step={step}  mode={info.get('mode','-')}  "
-              f"route_blocked={route_blocked}  blocked_now={blocked_now}")
-        t2 = (f"win={window}  obj_frames={obj_frames}  rate={rate:.2f}  "
-              f"avg_move={avg_move_m:.3f} m  "
-              f"min_goal_obj={('%.2f m'%min_goal_obj) if min_goal_obj is not None else '-'}")
+              f"stuck={int(stuck_state)}  sev={severity:.2f} avg={block_avg:.2f}")
+        t2 = (f"dyn={dyn_sev:.2f} static={static_density:.2f} move={move_mean:.3f}m")
         ax.set_title(t1 + "\n" + t2, loc="left", fontsize=10)
 
         ax.set_xlim(0, W); ax.set_ylim(H, 0)
@@ -175,12 +170,6 @@ def run_episode(env, max_steps=400, render_interval=0.05, seed=0):
 def main():
     seed = 7
     env = create_env(seed=seed)
-
-    # (중요) 겹치는데도 rate가 안 올라가면 아래 값을 키워서 쉽게 겹치도록 해봐:
-    # env.rb_goal_R_m = 1.4
-    # env.rb_obj_R_m  = 1.0
-    # env.rb_obj_frames = 4
-    # env.rb_win = 10
 
     run_episode(env, max_steps=600, render_interval=0.05, seed=seed)
 
