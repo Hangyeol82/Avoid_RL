@@ -65,11 +65,7 @@ def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=
             if soft is not None and np.max(soft) > 1e-3:
                 ax.imshow(soft, cmap="Oranges", origin="upper", alpha=0.35, vmin=0.0, vmax=1.0)
 
-        override_pts = getattr(env, "override_path_full", None)
-        if override_pts:
-            pts = np.array(list(override_pts), dtype=float)
-            if len(pts) > 0:
-                ax.plot(pts[:,0], pts[:,1], "c-", linewidth=2.0, alpha=0.8, label="Override CPP")
+        # 새 CPP는 env.waypoints 위에 그대로 표시되므로 별도 선을 덧그리지 않음
         if len(env.waypoints) > 0:
             ax.plot(env.waypoints[:,0], env.waypoints[:,1], "g--", alpha=0.6, label="CPP")
 
@@ -121,7 +117,7 @@ def main():
         raise FileNotFoundError("map_grid.npy / waypoints.npy 가 필요합니다.")
     grid = np.load(grid_path); wps = np.load(wps_path)
 
-    env = DynAvoidOneObjEnv(grid=grid, waypoints=wps, seed=5, cell_size_m=0.20)
+    env = DynAvoidOneObjEnv(grid=grid, waypoints=wps, seed=384731, cell_size_m=0.20)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
 
@@ -131,7 +127,7 @@ def main():
     ckpt_path = "checkpoints_dyn/ppo_dyn_iter500.pt"
     load_model(model, ckpt_path, device)
 
-    visualize_episode(env, model, device=device, render_interval=0.05, max_steps=1000, seed=seed)
+    visualize_episode(env, model, device=device, render_interval=0.01, max_steps=1500, seed=seed)
 
 
 if __name__ == "__main__":

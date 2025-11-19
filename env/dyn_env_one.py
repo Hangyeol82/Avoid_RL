@@ -7,6 +7,7 @@ from collections import deque
 
 from env.moving_object import MovingObj
 from planning.danger_zone import DangerZoneMap
+from planning.cpp import CoveragePlanner
 from utils_timing import estimate_robot_timeline
 
 
@@ -105,12 +106,22 @@ class DynAvoidOneObjEnv(gym.Env):
         self._prev_stuck_state = False
 
         self.danger_zone_map = DangerZoneMap(self.grid.shape, decay=0.92, hard_thr=0.6)
+        self.danger_block_threshold = 0.85
         self.obj_history_len = 25
         self.obj_histories = {}
         self.override_path = deque()
         self.override_target = None
         self.override_path_full = None
         self.covered_mask = np.zeros_like(self.grid, dtype=bool)
+        self.visible_obj_ids = set()
+        self.avoid_seen_obj_ids = set()
+        self.danger_stuck_radius = 8.0
+        self.danger_regions = {}
+        self.danger_release_radius = 2.2
+        self.danger_release_steps = 6
+        self._danger_release_timers = {}
+        self.goal_timeout_steps = 120
+        self.goal_stagnation_timer = 0
 
         # ====== 모드 전환 임계(칸 단위) ======
         self.collision_cells = 0.75
@@ -335,10 +346,12 @@ class DynAvoidOneObjEnv(gym.Env):
         # 동적 객체 관측(가림막 고려)
         per_obj_feats = []
         objs_metrics = []
+        visible_ids = set()
         if hasattr(self, "dynamic_objs") and len(self.dynamic_objs) > 0:
             for obj in self.dynamic_objs:
                 if self.consider_occlusion_in_obs and self.is_occluded_by_static(self.agent_rc, obj.p):
                     continue  # 보이지 않으면 관측에서 제외
+                visible_ids.add(id(obj))
                 oy, ox = obj.p
                 move_vec = self._obj_move_vec_cells(obj)
                 ovy, ovx = move_vec
@@ -389,6 +402,7 @@ class DynAvoidOneObjEnv(gym.Env):
             self._last_ttc = float(objs_metrics[0][-1])
         else:
             self._last_ttc = 1.0
+        self.visible_obj_ids = visible_ids
 
         obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays], axis=0)
         assert obs.shape[0] == self.obs_dim
@@ -488,8 +502,10 @@ class DynAvoidOneObjEnv(gym.Env):
             self.override_path_full = None
         return action
 
-    def _plan_path_with_mask(self, mask, goal_xy_cells):
-        start = (int(round(self.agent_rc[0])), int(round(self.agent_rc[1])))
+    def _plan_path_with_mask(self, mask, goal_xy_cells, start_rc=None):
+        if start_rc is None:
+            start_rc = self.agent_rc
+        start = (int(round(start_rc[0])), int(round(start_rc[1])))
         goal = (int(round(goal_xy_cells[1])), int(round(goal_xy_cells[0])))
         if not (0 <= goal[0] < self.H and 0 <= goal[1] < self.W):
             return None
@@ -503,6 +519,54 @@ class DynAvoidOneObjEnv(gym.Env):
         for r, c in path_rc[1:]:
             converted.append((float(c), float(r)))
         return converted
+
+    def _find_path_to_unvisited(self, start_rc=None):
+        if start_rc is None:
+            start_rc = self.agent_rc
+
+        sr = int(round(start_rc[0]))
+        sc = int(round(start_rc[1]))
+        if not (0 <= sr < self.H and 0 <= sc < self.W):
+            return None
+
+        danger_mask = self._danger_mask()
+        target_mask = (~self.covered_mask) & (~danger_mask) & (self.grid != 1)
+        if not np.any(target_mask):
+            return None
+
+        blocked = (self.grid == 1) | danger_mask
+        blocked = blocked.copy()
+        blocked[sr, sc] = False
+
+        q = deque([(sr, sc)])
+        came = {(sr, sc): None}
+        found = None
+
+        while q:
+            r, c = q.popleft()
+            if target_mask[r, c]:
+                found = (r, c)
+                break
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < self.H and 0 <= nc < self.W):
+                    continue
+                if blocked[nr, nc] or (nr, nc) in came:
+                    continue
+                came[(nr, nc)] = (r, c)
+                q.append((nr, nc))
+
+        if found is None:
+            return None
+
+        path_rc = []
+        cur = found
+        while cur is not None:
+            path_rc.append(cur)
+            cur = came[cur]
+        path_rc.reverse()
+
+        return [(float(c), float(r)) for r, c in path_rc]
 
     def _bfs_path(self, start, goal, mask):
         if mask[start[0], start[1]]:
@@ -534,37 +598,303 @@ class DynAvoidOneObjEnv(gym.Env):
         path.reverse()
         return path
 
-    def _handle_stuck(self, goal_xy_cells):
-        goal_rc = np.array([goal_xy_cells[1], goal_xy_cells[0]], dtype=float)
-        for obj in getattr(self, "dynamic_objs", []):
-            if np.linalg.norm(obj.p - goal_rc) <= (self.block_dyn_radius_cells + 1.0):
-                hist = self.obj_histories.get(id(obj))
-                if hist and len(hist) >= 2:
-                    pts = [(float(p[0]), float(p[1])) for p in hist]
-                    self.danger_zone_map.stamp_polyline(pts, radius_cells=1.0, val=0.8)
-                    for y, x in pts:
-                        for dy in range(-2, 3):
-                            for dx in range(-2, 3):
-                                dist = max(abs(dy), abs(dx))
-                                radius = 0.75 if dist <= 1 else 1.0
-                                self.danger_zone_map._stamp_disc(
-                                    self.danger_zone_map.soft,
-                                    y + dy,
-                                    x + dx,
-                                    radius,
-                                    0.8
-                                )
+    def _compute_cpp_mask(self, start_rc):
+        mask = ((self.grid == 1) | self.covered_mask).copy()
+        mask |= self._danger_mask()
+        sr = int(round(start_rc[0]))
+        sc = int(round(start_rc[1]))
+        if 0 <= sr < self.H and 0 <= sc < self.W:
+            mask[sr, sc] = False
+        return mask
 
-        mask = (self.grid == 1) | self.danger_zone_map.hard | self.covered_mask
-        path = self._plan_path_with_mask(mask, goal_xy_cells)
-        if path:
-            self.override_path = deque(path)
-            self.override_path_full = list(path)
-            target_xy = np.array([path[0][0], path[0][1]], dtype=float)
-            self.override_target = target_xy.copy()
-            if self.wp_idx < len(self.waypoints):
-                self.waypoints[self.wp_idx] = target_xy.copy()
-            self.deviated_from_cpp = True
+    def _clear_danger_along_path(self, path, radius_cells=1.5):
+        if not path or self.danger_zone_map is None:
+            return
+        soft = self.danger_zone_map.soft
+        H, W = soft.shape
+        for x, y in path:
+            cy = float(y)
+            cx = float(x)
+            r = float(radius_cells)
+            y0 = max(0, int(np.floor(cy - r - 1)))
+            y1 = min(H, int(np.ceil(cy + r + 2)))
+            x0 = max(0, int(np.floor(cx - r - 1)))
+            x1 = min(W, int(np.ceil(cx + r + 2)))
+            if y0 >= y1 or x0 >= x1:
+                continue
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            mask = (yy - cy)**2 + (xx - cx)**2 <= (r * r)
+            region = soft[y0:y1, x0:x1]
+            region[mask] = 0.0
+
+    def _build_cpp_path(self, start_rc=None):
+        if start_rc is None:
+            start_rc = self.agent_rc
+        components = self._unvisited_components()
+        if not components:
+            return []
+        nav_mask = (self.grid == 1) | self._danger_mask()
+        path = []
+        curr = np.array(start_rc, dtype=float)
+
+        for comp in components:
+            comp_set = {(y, x) for (y, x) in comp}
+            target = comp[0]
+            curr_rc = (int(round(curr[0])), int(round(curr[1])))
+            if curr_rc not in comp_set:
+                bridge = self._plan_path_with_mask(nav_mask, (float(target[1]), float(target[0])), start_rc=curr)
+                if not bridge:
+                    continue
+                if path and bridge[0] == path[-1]:
+                    path.extend(bridge[1:])
+                else:
+                    path.extend(bridge)
+                curr = np.array([bridge[-1][1], bridge[-1][0]], dtype=float)
+                curr_rc = (int(round(curr[0])), int(round(curr[1])))
+            if curr_rc not in comp_set:
+                continue
+
+            comp_mask = np.ones_like(self.grid, dtype=int)
+            for (y, x) in comp_set:
+                comp_mask[y, x] = 0
+            comp_mask[curr_rc[0], curr_rc[1]] = 2
+            try:
+                planner = CoveragePlanner(comp_mask)
+                planner.start()
+                planner.compute()
+                _, _, _, _, comp_traj = planner.result()
+            except Exception:
+                comp_traj = [(curr_rc[0], curr_rc[1])]
+            comp_path = [(float(x), float(y)) for y, x in comp_traj]
+            if not comp_path:
+                continue
+            if path and comp_path[0] == path[-1]:
+                path.extend(comp_path[1:])
+            else:
+                path.extend(comp_path)
+            curr = np.array([path[-1][1], path[-1][0]], dtype=float)
+
+        return path
+
+    def _apply_cpp_path(self, path_pts, *, clear_override=True, set_override_target=False):
+        if not path_pts:
+            return False
+        new_wps = np.array([[p[0], p[1]] for p in path_pts], dtype=np.float32)
+        if new_wps.ndim != 2 or new_wps.shape[1] != 2:
+            return False
+        self.waypoints = new_wps
+        self.visited = np.zeros(len(self.waypoints), dtype=bool)
+        self.wp_idx = 0
+        self.deviated_from_cpp = False
+        self.goal_stagnation_timer = 0
+        if clear_override:
+            self.override_path.clear()
+            self.override_target = None
+            self.override_path_full = None
+        if set_override_target and len(self.waypoints) > 0:
+            self.override_target = self.waypoints[0].copy()
+        return True
+
+    def _find_exit_path(self):
+        if self.danger_zone_map is None:
+            return None
+        danger = self.danger_zone_map.hard
+        sr = int(round(self.agent_rc[0]))
+        sc = int(round(self.agent_rc[1]))
+        if not (0 <= sr < self.H and 0 <= sc < self.W):
+            return None
+        if not danger[sr, sc]:
+            return None
+        blocked = (self.grid == 1)
+        q = deque([(sr, sc)])
+        came = {(sr, sc): None}
+        target = None
+        while q:
+            r, c = q.popleft()
+            if not danger[r, c]:
+                target = (r, c)
+                break
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < self.H and 0 <= nc < self.W):
+                    continue
+                if blocked[nr, nc] or (nr, nc) in came:
+                    continue
+                came[(nr, nc)] = (r, c)
+                q.append((nr, nc))
+        if target is None:
+            return None
+        path = []
+        cur = target
+        while cur is not None:
+            r, c = cur
+            path.append((float(c), float(r)))
+            cur = came[cur]
+        path.reverse()
+        return path
+
+    def _danger_mask(self):
+        if self.danger_zone_map is None:
+            return np.zeros_like(self.grid, dtype=bool)
+        soft = getattr(self.danger_zone_map, "soft", None)
+        if soft is None:
+            return np.zeros_like(self.grid, dtype=bool)
+        return soft >= float(getattr(self, "danger_block_threshold", 0.85))
+
+    def _unvisited_components(self):
+        danger_mask = self._danger_mask()
+        open_mask = (~self.covered_mask) & (~danger_mask) & (self.grid != 1)
+        seen = np.zeros_like(open_mask, dtype=bool)
+        comps = []
+        for r in range(self.H):
+            for c in range(self.W):
+                if not open_mask[r, c] or seen[r, c]:
+                    continue
+                comp = []
+                q = deque([(r, c)])
+                seen[r, c] = True
+                while q:
+                    y, x = q.popleft()
+                    comp.append((y, x))
+                    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                        ny, nx = y + dr, x + dc
+                        if 0 <= ny < self.H and 0 <= nx < self.W and open_mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            q.append((ny, nx))
+                comps.append(comp)
+        return comps
+
+    def _stamp_danger_pts(self, pts):
+        if self.danger_zone_map is None or not pts:
+            return
+        self.danger_zone_map.stamp_polyline(pts, radius_cells=1.2, val=0.9)
+        for y, x in pts:
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    dist = max(abs(dy), abs(dx))
+                    if dist == 0:
+                        radius = 0.7; val = 0.95
+                    elif dist == 1:
+                        radius = 0.9; val = 0.9
+                    else:
+                        radius = 1.1; val = 0.8
+                    self.danger_zone_map._stamp_disc(
+                        self.danger_zone_map.soft,
+                        y + dy,
+                        x + dx,
+                        radius,
+                        val
+                    )
+
+    def _rebuild_danger_map(self):
+        if self.danger_zone_map is None:
+            return
+        self.danger_zone_map.soft.fill(0.0)
+        for pts in self.danger_regions.values():
+            self._stamp_danger_pts(pts)
+
+    def _cleanup_danger_regions(self):
+        if not self.danger_regions:
+            return
+        current = {id(obj): obj for obj in getattr(self, "dynamic_objs", [])}
+        release_radius = float(getattr(self, "danger_release_radius", 2.5))
+        release_steps = int(getattr(self, "danger_release_steps", 5))
+        visible = getattr(self, "visible_obj_ids", set())
+        removed = False
+        for key in list(self.danger_regions.keys()):
+            obj = current.get(key)
+            if obj is None:
+                del self.danger_regions[key]
+                removed = True
+                self._danger_release_timers.pop(key, None)
+                continue
+            pts = np.array(self.danger_regions[key], dtype=float)
+            if pts.size == 0:
+                del self.danger_regions[key]
+                removed = True
+                self._danger_release_timers.pop(key, None)
+                continue
+            if key not in visible:
+                self._danger_release_timers.pop(key, None)
+                continue
+            dists = np.linalg.norm(pts - np.array([obj.p[0], obj.p[1]]), axis=1)
+            if dists.size == 0 or float(dists.min()) > release_radius:
+                cnt = self._danger_release_timers.get(key, 0) + 1
+                if cnt >= release_steps:
+                    del self.danger_regions[key]
+                    removed = True
+                    self._danger_release_timers.pop(key, None)
+                else:
+                    self._danger_release_timers[key] = cnt
+            else:
+                self._danger_release_timers[key] = 0
+        if removed:
+            self._rebuild_danger_map()
+            self._replan_after_danger_change()
+
+    def _replan_after_danger_change(self):
+        path_cpp = self._build_cpp_path(start_rc=self.agent_rc)
+        if not path_cpp:
+            return
+        self._apply_cpp_path(path_cpp)
+
+    def _handle_stuck(self, goal_xy_cells):
+        seen_ids = getattr(self, "avoid_seen_obj_ids", set())
+        updated = False
+        for obj in getattr(self, "dynamic_objs", []):
+            if seen_ids and id(obj) not in seen_ids:
+                continue
+            dr = float(np.linalg.norm(obj.p - self.agent_rc))
+            if dr > getattr(self, "danger_stuck_radius", 8.0):
+                continue
+            hist = self.obj_histories.get(id(obj))
+            if hist and len(hist) >= 2:
+                pts = [(float(p[0]), float(p[1])) for p in hist]
+                self.danger_regions[id(obj)] = pts
+                updated = True
+
+        if updated:
+            self._rebuild_danger_map()
+
+        exit_path = self._find_exit_path()
+        exit_queue = deque()
+        start_for_cpp = self.agent_rc.copy()
+        if exit_path and len(exit_path) > 1:
+            exit_queue.extend(exit_path[1:])
+            self._clear_danger_along_path(exit_path, radius_cells=2.0)
+            last = exit_path[-1]
+            start_for_cpp = np.array([last[1], last[0]], dtype=float)
+
+        bridge_path = self._find_path_to_unvisited(start_for_cpp)
+        bridge_queue = deque()
+        if bridge_path and len(bridge_path) > 1:
+            bridge_queue.extend(bridge_path[1:])
+            last = bridge_path[-1]
+            start_for_cpp = np.array([last[1], last[0]], dtype=float)
+
+        path_cpp = self._build_cpp_path(start_rc=start_for_cpp)
+        if not path_cpp:
+            mask = ((self.grid == 1) | self.covered_mask)
+            if self.danger_zone_map is not None:
+                mask |= self.danger_zone_map.hard
+            fallback = self._plan_path_with_mask(mask, goal_xy_cells, start_rc=start_for_cpp)
+            if fallback:
+                path_cpp = fallback
+
+        if path_cpp:
+            assigned = self._apply_cpp_path(path_cpp, clear_override=False, set_override_target=True)
+            if not assigned:
+                path_cpp = None
+
+        combined_override = deque()
+        if exit_queue:
+            combined_override.extend(exit_queue)
+            self.override_path_full = list(exit_path)
+        else:
+            self.override_path_full = None
+        if bridge_queue:
+            combined_override.extend(bridge_queue)
+        self.override_path = combined_override
 
     def _update_stuck_state(self, goal_xy_cells, info):
         metrics = {
@@ -682,6 +1012,11 @@ class DynAvoidOneObjEnv(gym.Env):
         self.override_path_full = None
         self.covered_mask.fill(False)
         self.covered_mask[int(self.agent_rc[0]), int(self.agent_rc[1])] = True
+        self.visible_obj_ids.clear()
+        self.avoid_seen_obj_ids.clear()
+        self.danger_regions.clear()
+        self._danger_release_timers.clear()
+        self.goal_stagnation_timer = 0
 
         self._prev_goal_dist_cells = None
 
@@ -786,6 +1121,7 @@ class DynAvoidOneObjEnv(gym.Env):
         for obj in getattr(self, "dynamic_objs", []):
             obj.move(self.grid)
         self._update_obj_histories()
+        self._cleanup_danger_regions()
 
         # 객체까지 거리(가림막 고려하여 모드 판단)
         dist_to_obj_m = self._distance_to_nearest_obj_m(visible_only=self.consider_occlusion_in_mode)
@@ -890,12 +1226,12 @@ class DynAvoidOneObjEnv(gym.Env):
                 reward -= 0.1
 
             # 대충 막히면 CPP 재동기화 플래그
-            if self.wp_idx < len(self.waypoints):
-                wx, wy = self.waypoints[self.wp_idx]
-                ay, ax = self.agent_rc
-                cpp_dist_cells = np.hypot(wy - ay, wx - ax)
-                if cpp_dist_cells > 3.0:
-                    self.deviated_from_cpp = True
+            # if self.wp_idx < len(self.waypoints):
+            #     wx, wy = self.waypoints[self.wp_idx]
+            #     ay, ax = self.agent_rc
+            #     cpp_dist_cells = np.hypot(wy - ay, wx - ax)
+            #     if cpp_dist_cells > 3.0:
+            #         self.deviated_from_cpp = True
 
         # === 이동 벡터 기록 ===
         dyx = self.agent_rc - self.prev_agent_rc
@@ -941,8 +1277,14 @@ class DynAvoidOneObjEnv(gym.Env):
         self._prev_stuck_state = bool(self._stuck_state)
         info["stuck_state"] = bool(self._stuck_state)
 
+        if mode == "AVOID":
+            self.avoid_seen_obj_ids = set(self.visible_obj_ids)
+        elif not self.override_path:
+            self.avoid_seen_obj_ids.clear()
+
         # 웨이포인트 처리
         if self._reached_waypoint():
+            self.goal_stagnation_timer = 0
             self.visited[self.wp_idx] = True
             reward += 0.4
             if self.wp_idx >= len(self.waypoints) - 1:
@@ -950,6 +1292,26 @@ class DynAvoidOneObjEnv(gym.Env):
                 reward += 2.0
             else:
                 self.wp_idx += 1
+        else:
+            self.goal_stagnation_timer += 1
+            if self.goal_stagnation_timer >= self.goal_timeout_steps:
+                self.goal_stagnation_timer = 0
+                mask = (self.grid == 1) | self.covered_mask
+                if self.danger_zone_map is not None:
+                    mask |= self.danger_zone_map.hard
+                new_path = self._plan_path_with_mask(mask, self.waypoints[-1])
+                if new_path:
+                    self._apply_cpp_path(new_path)
+
+        # Danger zone 침범 패널티
+        if self.danger_zone_map is not None:
+            yy = int(round(self.agent_rc[0]))
+            xx = int(round(self.agent_rc[1]))
+            if 0 <= yy < self.H and 0 <= xx < self.W:
+                sev = float(self.danger_zone_map.soft[yy, xx])
+                if sev >= self.danger_block_threshold:
+                    reward -= 2.0
+                    done = True
 
         # 보상 클리핑 폭 확대
         reward = float(np.clip(reward, -2.5, 2.5))
