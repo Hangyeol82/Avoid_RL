@@ -37,6 +37,7 @@ class DynAvoidOneObjEnv(gym.Env):
         ray_count: int = 64,
         consider_occlusion_in_obs: bool = True,
         consider_occlusion_in_mode: bool = True,
+        use_escape_subpolicy: bool = False,
     ):
         super().__init__()
         assert grid.ndim == 2
@@ -71,10 +72,11 @@ class DynAvoidOneObjEnv(gym.Env):
         # ----- 동적 객체 관측 슬롯 -----
         self.max_objs = int(max(1, max_objs))
         self.obj_feat_len = 5  # [dist_norm, cos, sin, speed_norm, ttc_norm]
+        self.danger_feat_len = 2  # [current danger, nearby max]
 
         # ----- 액션/관측 공간 -----
         self.action_space = spaces.Discrete(5)  # 0=상,1=좌,2=하,3=우,4=정지
-        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count
+        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
 
         # 이동 벡터(상,좌,하,우)
@@ -90,20 +92,31 @@ class DynAvoidOneObjEnv(gym.Env):
         self.visited: Optional[np.ndarray] = np.zeros(len(self.waypoints), dtype=bool)
         self.dynamic_objs: List[MovingObj] = []
 
-        # ----- stuck 상태 추적 -----
-        self.stuck_window = 15
-        self.stuck_progress_min = 0.05
-        self.stuck_eff_min = 0.15
-        self.stuck_move_min_m = 0.05
-        self.stuck_stagnation_radius_cells = 1.0
-        self.stuck_stagnation_steps = 15
+        # ----- stuck 상태 추적 (기존 값 주석, 완화된 값 적용) -----
+        # 기존 값:
+        self.stuck_window = 12
+        self.stuck_progress_min = 0.08
+        self.stuck_eff_min = 0.20
+        self.stuck_move_min_m = 0.06
+        self.stuck_stagnation_steps = 12
+        self.stuck_block_min = 0.35
+        # 완화된 값:
+        # self.stuck_window = 8
+        # self.stuck_progress_min = 0.10
+        # self.stuck_eff_min = 0.25
+        # self.stuck_move_min_m = 0.08
+        # self.stuck_stagnation_steps = 8
+        # self.stuck_block_min = 0.30
+
         self.stuck_goal_dist_min_cells = 2.0
-        self.stuck_block_min = 0.40
-        self.stuck_score_min = 1.5
+        self.stuck_stagnation_radius_cells = 1.0
+        
+        self.stuck_score_min = 1.5  # score_sum은 참고용
         self._stuck_hist = deque(maxlen=self.stuck_window)
         self._stuck_pos_hist = deque(maxlen=self.stuck_stagnation_steps)
         self._stuck_state = False
         self._prev_stuck_state = False
+        self._last_replan_reason = None
 
         self.danger_zone_map = DangerZoneMap(self.grid.shape, decay=0.92, hard_thr=0.6)
         self.danger_block_threshold = 0.85
@@ -120,8 +133,14 @@ class DynAvoidOneObjEnv(gym.Env):
         self.danger_release_radius = 2.2
         self.danger_release_steps = 6
         self._danger_release_timers = {}
+        # 소프트 위험 마스크 임계(경로/커버리지에서 회피). danger_block_threshold는 종료/패널티용.
+        self.danger_soft_block = 0.30
         self.goal_timeout_steps = 120
         self.goal_stagnation_timer = 0
+        self.use_escape_subpolicy = bool(use_escape_subpolicy)
+        self.escape_active = False
+        self.escape_release_steps = 3
+        self._escape_release_counter = 0
 
         # ====== 모드 전환 임계(칸 단위) ======
         self.collision_cells = 0.75
@@ -161,14 +180,16 @@ class DynAvoidOneObjEnv(gym.Env):
         self.delta_dist_coef = 0.15
         self.progress_coef   = 0.10
         self.progress_bonus  = 0.05
+        self.avoid_follow_bonus = self.follow_step_r * 0.6
 
         # 목표 진행도 캐시
         self._prev_goal_dist_cells = None
+        self._escape_release_counter = 0
 
         # 동적 객체 스폰
         self.reset()
 
-        # 렌더 옵션
+        # 렌더 옵션x
         self._render_on = False
         self._fig = None
         self._ax = None
@@ -200,6 +221,18 @@ class DynAvoidOneObjEnv(gym.Env):
 
     def _is_free(self, r, c):
         return 0 <= r < self.H and 0 <= c < self.W and self.grid[int(r), int(c)] != 1
+
+    def _agent_inside_danger(self):
+        if self.danger_zone_map is None:
+            return False
+        soft = getattr(self.danger_zone_map, "soft", None)
+        if soft is None:
+            return False
+        yy = int(round(self.agent_rc[0]))
+        xx = int(round(self.agent_rc[1]))
+        if not (0 <= yy < soft.shape[0] and 0 <= xx < soft.shape[1]):
+            return False
+        return bool(soft[yy, xx] >= float(self.danger_block_threshold))
 
     @staticmethod
     def _wrap_pi(a):
@@ -394,6 +427,24 @@ class DynAvoidOneObjEnv(gym.Env):
         rays_m = [self._raycast_static(origin, ang, self.R_ray_m) for ang in self.ray_angles]
         rays   = np.array([r / self.R_ray_m for r in rays_m], dtype=np.float32)
 
+        # 위험도 특징
+        danger_feats = np.zeros(self.danger_feat_len, dtype=np.float32)
+        if self.danger_zone_map is not None:
+            soft = getattr(self.danger_zone_map, "soft", None)
+            if soft is not None:
+                yy = int(round(ry))
+                xx = int(round(rx))
+                if 0 <= yy < soft.shape[0] and 0 <= xx < soft.shape[1]:
+                    danger_here = float(np.clip(soft[yy, xx], 0.0, 1.0))
+                    r = 3
+                    y0 = max(0, yy - r)
+                    y1 = min(soft.shape[0], yy + r + 1)
+                    x0 = max(0, xx - r)
+                    x1 = min(soft.shape[1], xx + r + 1)
+                    patch = soft[y0:y1, x0:x1]
+                    danger_near = float(np.clip(np.max(patch), 0.0, 1.0)) if patch.size > 0 else danger_here
+                    danger_feats[:] = [danger_here, danger_near]
+
         # 캐시
         self._last_d_goal_m = float(d_goal_m)
         self._last_goal_angle_math = self._goal_angle_math(dy_cells, dx_cells)
@@ -404,7 +455,7 @@ class DynAvoidOneObjEnv(gym.Env):
             self._last_ttc = 1.0
         self.visible_obj_ids = visible_ids
 
-        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays], axis=0)
+        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats], axis=0)
         assert obs.shape[0] == self.obs_dim
         return obs
 
@@ -739,7 +790,8 @@ class DynAvoidOneObjEnv(gym.Env):
         soft = getattr(self.danger_zone_map, "soft", None)
         if soft is None:
             return np.zeros_like(self.grid, dtype=bool)
-        return soft >= float(getattr(self, "danger_block_threshold", 0.85))
+        thr = float(getattr(self, "danger_soft_block", 0.3))
+        return soft >= thr
 
     def _unvisited_components(self):
         danger_mask = self._danger_mask()
@@ -830,15 +882,55 @@ class DynAvoidOneObjEnv(gym.Env):
                 self._danger_release_timers[key] = 0
         if removed:
             self._rebuild_danger_map()
-            self._replan_after_danger_change()
+            # sub-policy를 사용할 때는 CPP 재계획을 ESCAPE 종료 시점에만 수행
+            if not getattr(self, "use_escape_subpolicy", False):
+                self._replan_after_danger_change()
 
     def _replan_after_danger_change(self):
+        # use_escape_subpolicy가 켜져 있으면 ESCAPE 종료 시점에만 CPP를 재계획한다.
+        if getattr(self, "use_escape_subpolicy", False):
+            return
         path_cpp = self._build_cpp_path(start_rc=self.agent_rc)
         if not path_cpp:
             return
+        self._last_replan_reason = "danger_cleanup"
         self._apply_cpp_path(path_cpp)
 
     def _handle_stuck(self, goal_xy_cells):
+        if self.use_escape_subpolicy:
+            # danger 영역만 갱신하고 sub-policy에 제어권을 넘김
+            seen_ids = getattr(self, "avoid_seen_obj_ids", set())
+            updated = False
+            for obj in getattr(self, "dynamic_objs", []):
+                if seen_ids and id(obj) not in seen_ids:
+                    continue
+                dr = float(np.linalg.norm(obj.p - self.agent_rc))
+                if dr > getattr(self, "danger_stuck_radius", 8.0):
+                    continue
+                hist = self.obj_histories.get(id(obj))
+                if hist and len(hist) >= 2:
+                    pts = [(float(p[0]), float(p[1])) for p in hist]
+                    self.danger_regions[id(obj)] = pts
+                    updated = True
+            if updated:
+                self._rebuild_danger_map()
+            # danger zone이 없어도 stuck이면 ESCAPE를 켜 주자
+            hard = None
+            if self.danger_zone_map is not None:
+                hard = getattr(self.danger_zone_map, "hard", None)
+            in_danger = self._agent_inside_danger()
+            near_danger = False
+            if hard is not None and np.any(hard):
+                ay = int(round(self.agent_rc[0])); ax = int(round(self.agent_rc[1]))
+                idx = np.argwhere(hard)
+                if idx.size > 0:
+                    d = np.min(np.linalg.norm(idx - np.array([ay, ax]), axis=1))
+                    near_danger = d <= 2.0
+            if in_danger or near_danger or updated:
+                self.escape_active = True
+                self._escape_release_counter = 0
+            return
+
         seen_ids = getattr(self, "avoid_seen_obj_ids", set())
         updated = False
         for obj in getattr(self, "dynamic_objs", []):
@@ -861,7 +953,6 @@ class DynAvoidOneObjEnv(gym.Env):
         start_for_cpp = self.agent_rc.copy()
         if exit_path and len(exit_path) > 1:
             exit_queue.extend(exit_path[1:])
-            self._clear_danger_along_path(exit_path, radius_cells=2.0)
             last = exit_path[-1]
             start_for_cpp = np.array([last[1], last[0]], dtype=float)
 
@@ -885,6 +976,8 @@ class DynAvoidOneObjEnv(gym.Env):
             assigned = self._apply_cpp_path(path_cpp, clear_override=False, set_override_target=True)
             if not assigned:
                 path_cpp = None
+            else:
+                self._last_replan_reason = "stuck_replan"
 
         combined_override = deque()
         if exit_queue:
@@ -940,12 +1033,21 @@ class DynAvoidOneObjEnv(gym.Env):
         move_score = _clip((self.stuck_move_min_m - mean_move) / max(self.stuck_move_min_m, 1e-6))
         score_sum = block_score + prog_score + eff_score + move_score
 
+        # 이전(보수적) 로직:
         self._stuck_state = (
             satisfied >= 2 and
             score_sum >= self.stuck_score_min and
             stagnating and
             far_from_goal
         )
+        # 완화 로직: 4개 조건 중 2개 이상이면서 정체(stagnating)거나 목표까지 멀면 stuck
+        # self._stuck_state = (
+        #     satisfied >= 2 and
+        #     (stagnating or far_from_goal)
+        # )
+        # 추가로 일정 스텝(기본 18) 목표 미도달 시 stuck 처리
+        if self.goal_stagnation_timer >= getattr(self, "stuck_goal_miss_steps", 23):
+            self._stuck_state = True
 
     def _motion_metrics(self, goal_xy_cells, zero_tol=1e-6, jitter_tol_cells=0.25):
         v = np.array(self.rb_hist_vec, dtype=float)
@@ -1004,6 +1106,7 @@ class DynAvoidOneObjEnv(gym.Env):
         self._stuck_pos_hist.clear()
         self._stuck_state = False
         self._prev_stuck_state = False
+        self._last_replan_reason = None
 
         self.danger_zone_map.clear()
         self.obj_histories.clear()
@@ -1134,6 +1237,8 @@ class DynAvoidOneObjEnv(gym.Env):
         mode = "AVOID" if dist_to_obj_cells < DANGER else "FOLLOW_CPP"
         if self.override_path:
             mode = "FOLLOW_CPP"
+        if self.use_escape_subpolicy and getattr(self, "escape_active", False):
+            mode = "ESCAPE"
         info["mode"] = mode
         info["override_active"] = bool(self.override_path)
 
@@ -1269,6 +1374,7 @@ class DynAvoidOneObjEnv(gym.Env):
         info["efficiency"] = eff
         info["backtrack_rate"] = backrate
         info["prog_ratio"] = prog_ratio
+        info["last_replan_reason"] = self._last_replan_reason
 
         prev_stuck = bool(self._stuck_state)
         self._update_stuck_state(np.array(goal_xy_cells, dtype=float), info)
@@ -1281,6 +1387,20 @@ class DynAvoidOneObjEnv(gym.Env):
             self.avoid_seen_obj_ids = set(self.visible_obj_ids)
         elif not self.override_path:
             self.avoid_seen_obj_ids.clear()
+
+        # ESCAPE 모드 해제 조건: 위험 구역을 벗어나 일정 스텝 유지
+        if self.use_escape_subpolicy and getattr(self, "escape_active", False):
+            if not self._agent_inside_danger():
+                self._escape_release_counter += 1
+                if self._escape_release_counter >= getattr(self, "escape_release_steps", 3):
+                    self.escape_active = False
+                    self._escape_release_counter = 0
+                    new_cpp = self._build_cpp_path(start_rc=self.agent_rc.copy())
+                    if new_cpp:
+                        self._last_replan_reason = "escape_complete"
+                        self._apply_cpp_path(new_cpp)
+            else:
+                self._escape_release_counter = 0
 
         # 웨이포인트 처리
         if self._reached_waypoint():
@@ -1303,8 +1423,9 @@ class DynAvoidOneObjEnv(gym.Env):
                 if new_path:
                     self._apply_cpp_path(new_path)
 
-        # Danger zone 침범 패널티
-        if self.danger_zone_map is not None:
+        # Danger zone 침범 패널티 (ESCAPE 모드일 땐 종료시키지 않음)
+        skip_danger_penalty = self.use_escape_subpolicy and getattr(self, "escape_active", False)
+        if self.danger_zone_map is not None and not skip_danger_penalty:
             yy = int(round(self.agent_rc[0]))
             xx = int(round(self.agent_rc[1]))
             if 0 <= yy < self.H and 0 <= xx < self.W:

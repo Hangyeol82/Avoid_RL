@@ -317,8 +317,8 @@ def main():
         gae_lambda=0.95,
         device="cpu",
         seed=0,
-        hidden_sizes=(256,256,256),
-        feat_dim=256
+        hidden_sizes=(320,320,320),
+        feat_dim=320
     )
 
     trainer = PPOTrainer(env, cfg)
