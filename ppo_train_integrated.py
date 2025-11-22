@@ -25,8 +25,10 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--hidden-sizes", type=int, nargs="+", default=[320, 320, 320])
-    p.add_argument("--feat-dim", type=int, default=320)
+    p.add_argument("--main-hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
+    p.add_argument("--escape-hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
+    p.add_argument("--main-feat-dim", type=int, default=384)
+    p.add_argument("--escape-feat-dim", type=int, default=384)
     # 경로/저장
     p.add_argument("--out-dir", default="checkpoints_integrated")
     p.add_argument("--save-interval", type=int, default=50)
@@ -174,8 +176,8 @@ def main():
     cfg_main = PPOConfig(
         obs_dim=env_main.observation_space.shape[0],
         act_dim=env_main.action_space.n,
-        hidden_sizes=tuple(args.hidden_sizes),
-        feat_dim=args.feat_dim,
+        hidden_sizes=tuple(args.main_hidden_sizes),
+        feat_dim=args.main_feat_dim,
         rollout_steps=args.rollout_steps,
         lr=args.lr,
         epochs=args.epochs,
@@ -186,8 +188,8 @@ def main():
     cfg_escape = PPOConfig(
         obs_dim=env_escape.observation_space.shape[0],
         act_dim=env_escape.action_space.n,
-        hidden_sizes=tuple(args.hidden_sizes),
-        feat_dim=args.feat_dim,
+        hidden_sizes=tuple(args.escape_hidden_sizes),
+        feat_dim=args.escape_feat_dim,
         rollout_steps=args.rollout_steps,
         lr=args.lr,
         epochs=args.epochs,
@@ -243,4 +245,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

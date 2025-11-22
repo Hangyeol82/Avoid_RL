@@ -73,10 +73,11 @@ class DynAvoidOneObjEnv(gym.Env):
         self.max_objs = int(max(1, max_objs))
         self.obj_feat_len = 5  # [dist_norm, cos, sin, speed_norm, ttc_norm]
         self.danger_feat_len = 2  # [current danger, nearby max]
+        self.danger_lidar_bins = 16
 
         # ----- 액션/관측 공간 -----
         self.action_space = spaces.Discrete(5)  # 0=상,1=좌,2=하,3=우,4=정지
-        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len
+        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len + self.danger_lidar_bins
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
 
         # 이동 벡터(상,좌,하,우)
@@ -258,6 +259,29 @@ class DynAvoidOneObjEnv(gym.Env):
     def _goal_angle_math(self, dy_cells, dx_cells):
         return float(np.arctan2(-dy_cells, dx_cells))
 
+    def _danger_lidar(self, bins=16, max_range=6.0):
+        if self.danger_zone_map is None or getattr(self.danger_zone_map, "soft", None) is None:
+            return np.zeros(bins, dtype=np.float32)
+        soft = self.danger_zone_map.soft
+        angles = np.linspace(-np.pi, np.pi, bins, endpoint=False)
+        ry, rx = self.agent_rc
+        H, W = soft.shape
+        readings = np.zeros(bins, dtype=np.float32)
+        steps = int(max_range * 4)  # 세밀한 샘플링
+        for i, ang in enumerate(angles):
+            val = 0.0
+            for t in range(1, steps + 1):
+                dy = np.sin(ang) * (t * max_range / steps)
+                dx = np.cos(ang) * (t * max_range / steps)
+                yy = int(round(ry + dy))
+                xx = int(round(rx + dx))
+                if not (0 <= yy < H and 0 <= xx < W):
+                    break
+                val = max(val, float(soft[yy, xx]))
+                if val >= 0.99:
+                    break
+            readings[i] = val
+        return readings
     # ----------------------- 브레젠험: 가림막 판정 -----------------------
     @staticmethod
     def _bresenham_cells(y0: int, x0: int, y1: int, x1: int):
@@ -441,7 +465,7 @@ class DynAvoidOneObjEnv(gym.Env):
         rays_m = [self._raycast_static(origin, ang, self.R_ray_m) for ang in self.ray_angles]
         rays   = np.array([r / self.R_ray_m for r in rays_m], dtype=np.float32)
 
-        # 위험도 특징
+        # 위험도 특징 + danger "라이다"
         danger_feats = np.zeros(self.danger_feat_len, dtype=np.float32)
         if self.danger_zone_map is not None:
             soft = getattr(self.danger_zone_map, "soft", None)
@@ -458,6 +482,7 @@ class DynAvoidOneObjEnv(gym.Env):
                     patch = soft[y0:y1, x0:x1]
                     danger_near = float(np.clip(np.max(patch), 0.0, 1.0)) if patch.size > 0 else danger_here
                     danger_feats[:] = [danger_here, danger_near]
+        danger_lidar = self._danger_lidar(bins=getattr(self, "danger_lidar_bins", 16), max_range=6.0)
 
         # 캐시
         self._last_d_goal_m = float(d_goal_m)
@@ -469,7 +494,7 @@ class DynAvoidOneObjEnv(gym.Env):
             self._last_ttc = 1.0
         self.visible_obj_ids = visible_ids
 
-        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats], axis=0)
+        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats, danger_lidar], axis=0)
         assert obs.shape[0] == self.obs_dim
         return obs
 
@@ -540,6 +565,9 @@ class DynAvoidOneObjEnv(gym.Env):
         for key in list(self.obj_histories.keys()):
             if key not in active:
                 del self.obj_histories[key]
+        # danger_regions를 매 스텝 다시 찍어서 객체가 있는 동안 위험도가 사라지지 않게 유지
+        if getattr(self, "danger_regions", None):
+            self._rebuild_danger_map()
 
     def _follow_override_path(self):
         if not self.override_path:

@@ -8,6 +8,12 @@ import matplotlib.pyplot as plt
 from env.dyn_env_one import DynAvoidOneObjEnv
 from rl.network import ActorCritic
 
+# 모델 아키텍처 기본값 (메인/서브 분리)
+MAIN_HIDDEN = (512, 512, 256)
+MAIN_FEAT   = 256
+ESC_HIDDEN  = (384, 384, 256)
+ESC_FEAT    = 256
+
 
 def load_model(model, path, device="cpu"):
     if os.path.exists(path):
@@ -115,11 +121,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
     
 def main():
     parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
-    parser.add_argument("--ckpt", default="checkpoints_dyn/ppo_dyn_iter500.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_escape_from_dyn/escape_from_dyn_iter200.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--ckpt", default="checkpoints_integrated/main_iter500.pt")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=282)
+    parser.add_argument("--seed", type=int, default=3686)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)
@@ -138,12 +144,12 @@ def main():
     act_dim = env.action_space.n
 
     device = args.device
-    model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=(320,320,320), feat_dim=320).to(device)
+    model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=MAIN_HIDDEN, feat_dim=MAIN_FEAT).to(device)
     load_model(model, args.ckpt, device)
 
     escape_model = None
     if use_escape:
-        escape_model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=(320,320,320), feat_dim=320).to(device)
+        escape_model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=ESC_HIDDEN, feat_dim=ESC_FEAT).to(device)
         load_model(escape_model, args.escape_ckpt, device)
 
     visualize_episode(env, model, escape_model=escape_model, device=device, render_interval=args.render_interval, max_steps=args.max_steps, seed=seed)
