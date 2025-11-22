@@ -119,7 +119,7 @@ def main():
     parser.add_argument("--escape-ckpt", default="checkpoints_escape_from_dyn/escape_from_dyn_iter200.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=7922)
+    parser.add_argument("--seed", type=int, default=282)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)

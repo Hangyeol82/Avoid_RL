@@ -234,6 +234,20 @@ class DynAvoidOneObjEnv(gym.Env):
             return False
         return bool(soft[yy, xx] >= float(self.danger_block_threshold))
 
+    def _agent_inside_soft_danger(self):
+        """Soft 임계(danger_soft_block) 기준 위험 여부."""
+        if self.danger_zone_map is None:
+            return False
+        soft = getattr(self.danger_zone_map, "soft", None)
+        if soft is None:
+            return False
+        yy = int(round(self.agent_rc[0]))
+        xx = int(round(self.agent_rc[1]))
+        if not (0 <= yy < soft.shape[0] and 0 <= xx < soft.shape[1]):
+            return False
+        thr = float(getattr(self, "danger_soft_block", 0.3))
+        return bool(soft[yy, xx] >= thr)
+
     @staticmethod
     def _wrap_pi(a):
         out = (a + np.pi) % (2*np.pi)
@@ -1390,7 +1404,7 @@ class DynAvoidOneObjEnv(gym.Env):
 
         # ESCAPE 모드 해제 조건: 위험 구역을 벗어나 일정 스텝 유지
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
-            if not self._agent_inside_danger():
+            if not self._agent_inside_soft_danger():
                 self._escape_release_counter += 1
                 if self._escape_release_counter >= getattr(self, "escape_release_steps", 3):
                     self.escape_active = False
