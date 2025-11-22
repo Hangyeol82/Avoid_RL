@@ -1,0 +1,246 @@
+import os
+import argparse
+import numpy as np
+import torch
+from torch.distributions import Categorical
+
+from env.dyn_env_one import DynAvoidOneObjEnv
+from env.env import make_map_30
+from rl.ppo import PPOConfig, PPOTrainer
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Main + Escape 통합 학습 (escape iter 기준)")
+    p.add_argument("--random-map", action="store_true")
+    p.add_argument("--map-size", type=int, default=30)
+    p.add_argument("--regen-map-interval", type=int, default=10, help="이 주기(escape iter 기준)마다 새 맵 생성 (0이면 고정)")
+    p.add_argument("--grid-path", default="map_grid.npy")
+    p.add_argument("--waypoints-path", default="waypoints.npy")
+    p.add_argument("--escape-updates", type=int, default=300)
+    p.add_argument("--main-every", type=int, default=5, help="escape iter마다 main을 학습할 간격(0이면 main 학습 안함)")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--seed", type=int, default=1234)
+    # PPO 공통
+    p.add_argument("--rollout-steps", type=int, default=2048)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--hidden-sizes", type=int, nargs="+", default=[320, 320, 320])
+    p.add_argument("--feat-dim", type=int, default=320)
+    # 경로/저장
+    p.add_argument("--out-dir", default="checkpoints_integrated")
+    p.add_argument("--save-interval", type=int, default=50)
+    p.add_argument("--pretrained-main", default=None)
+    p.add_argument("--pretrained-escape", default=None)
+    return p.parse_args()
+
+
+def load_array(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return np.load(path)
+
+
+def detect_device(arg_device: str):
+    if arg_device != "auto":
+        return arg_device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def build_map(args, seed):
+    if args.random_map:
+        grid, wps, _ = make_map_30(seed=seed, size=args.map_size)
+    else:
+        grid = load_array(args.grid_path)
+        wps = load_array(args.waypoints_path)
+    return grid, wps
+
+
+def build_env(grid, wps, seed, use_escape=False, cell_size=0.20):
+    return DynAvoidOneObjEnv(
+        grid=grid,
+        waypoints=wps,
+        seed=seed,
+        cell_size_m=cell_size,
+        use_escape_subpolicy=use_escape,
+    )
+
+
+def switch_env(trainer: PPOTrainer, env, device):
+    trainer.env = env
+    obs, _ = env.reset()
+    trainer._curr_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+
+
+def collect_escape_segments(trainer: PPOTrainer, cfg, pre_steps=12, escape_release_steps=3):
+    env = trainer.env
+    model = trainer.model
+    buffer = trainer.buffer
+    device = trainer.device
+    buffer.clear()
+
+    max_cap = buffer.cfg.max_size
+    if not hasattr(trainer, "_curr_obs"):
+        obs, _ = env.reset()
+        trainer._curr_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+    curr_obs = trainer._curr_obs
+    prev_info = {}
+
+    from collections import deque
+    pre_buf = deque(maxlen=pre_steps)
+    recording = False
+    escape_out_counter = 0
+
+    collected = 0
+    while collected < cfg.rollout_steps and buffer.ptr < max_cap:
+        obs_t = curr_obs.unsqueeze(0)
+        with torch.no_grad():
+            logits, value = model(obs_t)
+            value = value.squeeze(0).squeeze(-1)
+            dist = Categorical(logits=logits.squeeze(0))
+            action = dist.sample()
+            logprob = dist.log_prob(action)
+
+        next_obs, reward, done, trunc, info = env.step(int(action.item()))
+        done_flag = bool(done or trunc)
+
+        is_stuck = bool(info.get("stuck_state", False))
+        was_stuck = bool(prev_info.get("stuck_state", False))
+        mode = info.get("mode", "")
+
+        pre_buf.append((curr_obs, action, logprob, float(reward), done_flag, value))
+
+        if not recording and is_stuck and not was_stuck:
+            for (o, a, lp, r, d, v) in pre_buf:
+                if buffer.ptr >= max_cap or collected >= cfg.rollout_steps:
+                    break
+                buffer.store(obs=o, action=a, logprob=lp, reward=r, done=d, value=v, mask=True)
+                collected += 1
+            recording = True
+
+        if recording:
+            if buffer.ptr >= max_cap or collected >= cfg.rollout_steps:
+                break
+            buffer.store(obs=curr_obs, action=action, logprob=logprob, reward=float(reward), done=done_flag, value=value, mask=True)
+            collected += 1
+
+        if recording:
+            if not is_stuck and mode != "ESCAPE":
+                escape_out_counter += 1
+                if escape_out_counter >= escape_release_steps:
+                    recording = False
+                    escape_out_counter = 0
+                    with torch.no_grad():
+                        _, v_boot = model(torch.as_tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0))
+                        v_boot = v_boot.squeeze(0).squeeze(-1)
+                    buffer.finish_path(last_value=v_boot)
+                    pre_buf.clear()
+            else:
+                escape_out_counter = 0
+
+        if done_flag:
+            if recording:
+                buffer.finish_path(last_value=torch.zeros((), device=device))
+                recording = False
+                escape_out_counter = 0
+                pre_buf.clear()
+            next_obs, _ = env.reset()
+            curr_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+            prev_info = {}
+            continue
+
+        curr_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+        prev_info = info
+
+    if recording:
+        with torch.no_grad():
+            _, v_boot = model(curr_obs.unsqueeze(0))
+            v_boot = v_boot.squeeze(0).squeeze(-1)
+        buffer.finish_path(last_value=v_boot)
+
+    trainer._curr_obs = curr_obs
+    return collected
+
+
+def main():
+    args = parse_args()
+    device = detect_device(args.device)
+    map_seed = args.seed
+
+    grid, wps = build_map(args, map_seed)
+    env_main = build_env(grid, wps, seed=args.seed, use_escape=False)
+    env_escape = build_env(grid, wps, seed=args.seed + 1, use_escape=True)
+
+    cfg_main = PPOConfig(
+        obs_dim=env_main.observation_space.shape[0],
+        act_dim=env_main.action_space.n,
+        hidden_sizes=tuple(args.hidden_sizes),
+        feat_dim=args.feat_dim,
+        rollout_steps=args.rollout_steps,
+        lr=args.lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        device=device,
+        seed=args.seed,
+    )
+    cfg_escape = PPOConfig(
+        obs_dim=env_escape.observation_space.shape[0],
+        act_dim=env_escape.action_space.n,
+        hidden_sizes=tuple(args.hidden_sizes),
+        feat_dim=args.feat_dim,
+        rollout_steps=args.rollout_steps,
+        lr=args.lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        device=device,
+        seed=args.seed + 999,
+    )
+
+    trainer_main = PPOTrainer(env_main, cfg_main)
+    trainer_escape = PPOTrainer(env_escape, cfg_escape)
+
+    if args.pretrained_main and os.path.exists(args.pretrained_main):
+        trainer_main.model.load_state_dict(torch.load(args.pretrained_main, map_location=device), strict=False)
+        print(f"[INFO] loaded main pretrained: {args.pretrained_main}")
+    if args.pretrained_escape and os.path.exists(args.pretrained_escape):
+        trainer_escape.model.load_state_dict(torch.load(args.pretrained_escape, map_location=device), strict=False)
+        print(f"[INFO] loaded escape pretrained: {args.pretrained_escape}")
+
+    print(f"[INFO] device={device}, escape_updates={args.escape_updates}, main_every={args.main_every}")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    for it in range(1, args.escape_updates + 1):
+        # 맵 재생성
+        if args.regen_map_interval > 0 and it % args.regen_map_interval == 0:
+            map_seed += 1
+            grid, wps = build_map(args, map_seed)
+            switch_env(trainer_main, build_env(grid, wps, seed=map_seed, use_escape=False), device)
+            switch_env(trainer_escape, build_env(grid, wps, seed=map_seed + 1, use_escape=True), device)
+            print(f"[INFO] regenerated map at escape iter {it} (seed={map_seed})")
+
+        # escape 수집/업데이트
+        steps_escape = collect_escape_segments(trainer_escape, cfg_escape, pre_steps=12, escape_release_steps=3)
+        logs_escape = trainer_escape.update()
+
+        # main 업데이트 (옵션)
+        logs_main = {}
+        if args.main_every > 0 and (it % args.main_every == 0):
+            steps_main = trainer_main.collect_rollout()
+            logs_main = trainer_main.update()
+            print("[MAIN]", {"iter": it, "steps": steps_main, **{k: f"{v:.4f}" for k, v in (logs_main or {}).items()}})
+
+        print("[ESC ]", {"iter": it, "steps": steps_escape, **{k: f"{v:.4f}" for k, v in (logs_escape or {}).items()}})
+
+        if it % args.save_interval == 0:
+            torch.save(trainer_escape.model.state_dict(), os.path.join(args.out_dir, f"escape_iter{it}.pt"))
+            torch.save(trainer_main.model.state_dict(), os.path.join(args.out_dir, f"main_iter{it}.pt"))
+
+    torch.save(trainer_escape.model.state_dict(), os.path.join(args.out_dir, f"escape_iter{args.escape_updates}.pt"))
+    torch.save(trainer_main.model.state_dict(), os.path.join(args.out_dir, f"main_iter{args.escape_updates}.pt"))
+    print(f"[DONE] saved final models to {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
