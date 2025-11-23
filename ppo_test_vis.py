@@ -8,11 +8,11 @@ import matplotlib.pyplot as plt
 from env.dyn_env_one import DynAvoidOneObjEnv
 from rl.network import ActorCritic
 
-# 모델 아키텍처 기본값 (메인/서브 분리)
+# 모델 아키텍처 기본값 (통합 학습 스크립트와 동일)
 MAIN_HIDDEN = (512, 512, 256)
-MAIN_FEAT   = 256
-ESC_HIDDEN  = (384, 384, 256)
-ESC_FEAT    = 256
+MAIN_FEAT   = 384
+ESC_HIDDEN  = (512, 512, 256)
+ESC_FEAT    = 384
 
 
 def load_model(model, path, device="cpu"):
@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--escape-ckpt", default="checkpoints_integrated/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=3686)
+    parser.add_argument("--seed", type=int, default=7336)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)

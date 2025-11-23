@@ -26,18 +26,21 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cpu")
     p.add_argument("--updates", type=int, default=300)
-    p.add_argument("--rollout-steps", type=int, default=2048)
-    p.add_argument("--save-interval", type=int, default=50)
+    p.add_argument("--rollout-steps", type=int, default=4096)
+    p.add_argument("--save-interval", type=int, default=100)
     p.add_argument("--out-dir", default="checkpoints_escape_from_dyn")
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
     p.add_argument("--feat-dim", type=int, default=256)
     p.add_argument("--pretrained", default=None)
     p.add_argument("--cell-size", type=float, default=0.20)
     p.add_argument("--pre-stuck-steps", type=int, default=12, help="stuck 직전 포함할 스텝 수")
     p.add_argument("--escape-release-steps", type=int, default=3, help="danger를 벗어난 뒤 기록 종료까지 유지할 스텝")
+    # Colab Drive 연동
+    p.add_argument("--mount-drive", action="store_true", help="Colab에서 Google Drive 마운트 시도")
+    p.add_argument("--drive-out-dir", default=None, help="지정 시 out-dir 대신 이 경로에 저장 (예: /content/drive/MyDrive/escape_ckpt)")
     return p.parse_args()
 
 
@@ -168,6 +171,18 @@ def collect_escape_segments(trainer: PPOTrainer, cfg, pre_steps=12, escape_relea
 def main():
     args = parse_args()
     map_seed = args.seed
+    out_dir = args.out_dir
+    if args.drive_out_dir:
+        out_dir = args.drive_out_dir
+    if args.mount_drive or (out_dir and "/content/drive" in out_dir):
+        try:
+            from google.colab import drive  # type: ignore
+            drive.mount("/content/drive")
+            print("[INFO] Mounted Google Drive at /content/drive")
+        except Exception as e:
+            print(f"[WARN] Drive mount failed or not in Colab: {e}")
+    os.makedirs(out_dir, exist_ok=True)
+
     env = build_env(args, seed=map_seed)
 
     cfg = PPOConfig(
@@ -217,13 +232,13 @@ def main():
         print("[TRAIN]", summary)
 
         if it % args.save_interval == 0:
-            os.makedirs(args.out_dir, exist_ok=True)
-            path = os.path.join(args.out_dir, f"escape_from_dyn_iter{it}.pt")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"escape_from_dyn_iter{it}.pt")
             torch.save(trainer.model.state_dict(), path)
             print(f"[CKPT] saved => {path}")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    final_path = os.path.join(args.out_dir, f"escape_from_dyn_iter{args.updates}.pt")
+    os.makedirs(out_dir, exist_ok=True)
+    final_path = os.path.join(out_dir, f"escape_from_dyn_iter{args.updates}.pt")
     torch.save(trainer.model.state_dict(), final_path)
     print(f"[DONE] saved => {final_path}")
 
