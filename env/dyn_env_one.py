@@ -1473,8 +1473,9 @@ class DynAvoidOneObjEnv(gym.Env):
             if 0 <= yy < self.H and 0 <= xx < self.W:
                 sev = float(self.danger_zone_map.soft[yy, xx])
                 if sev >= self.danger_block_threshold:
+                    # 기존: reward -= 2.0; done = True
+                    # 변경: 즉시 종료하지 않고 큰 패널티만 부여
                     reward -= 2.0
-                    done = True
 
         # 보상 클리핑 폭 확대
         reward = float(np.clip(reward, -2.5, 2.5))
