@@ -13,7 +13,7 @@ from rl.ppo import PPOConfig, PPOTrainer
 # =============================================================================
 #  전이학습 설정: 불러올 모델 경로 (없으면 None)
 # =============================================================================
-PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/ppo_dyn_iter400.pt"
+PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/main_200iter_colab.pt"
 # =============================================================================
 
 

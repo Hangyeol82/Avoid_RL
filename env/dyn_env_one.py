@@ -93,21 +93,13 @@ class DynAvoidOneObjEnv(gym.Env):
         self.visited: Optional[np.ndarray] = np.zeros(len(self.waypoints), dtype=bool)
         self.dynamic_objs: List[MovingObj] = []
 
-        # ----- stuck 상태 추적 (기존 값 주석, 완화된 값 적용) -----
-        # 기존 값:
-        self.stuck_window = 12
-        self.stuck_progress_min = 0.08
-        self.stuck_eff_min = 0.20
-        self.stuck_move_min_m = 0.06
-        self.stuck_stagnation_steps = 12
-        self.stuck_block_min = 0.35
-        # 완화된 값:
-        # self.stuck_window = 8
-        # self.stuck_progress_min = 0.10
-        # self.stuck_eff_min = 0.25
-        # self.stuck_move_min_m = 0.08
-        # self.stuck_stagnation_steps = 8
-        # self.stuck_block_min = 0.30
+        # ----- stuck 상태 추적 (보수적으로 상향) -----
+        self.stuck_window = 16
+        self.stuck_progress_min = 0.05
+        self.stuck_eff_min = 0.15
+        self.stuck_move_min_m = 0.05
+        self.stuck_stagnation_steps = 16
+        self.stuck_block_min = 0.45
 
         self.stuck_goal_dist_min_cells = 2.0
         self.stuck_stagnation_radius_cells = 1.0
@@ -131,7 +123,9 @@ class DynAvoidOneObjEnv(gym.Env):
         self.avoid_seen_obj_ids = set()
         self.danger_stuck_radius = 8.0
         self.danger_regions = {}
-        self.danger_release_radius = 2.2
+        self.danger_goal_points = {}  # key -> [목표 좌표 스냅샷들]
+        self.danger_goal_links = {}
+        self.danger_release_radius = 3.0
         self.danger_release_steps = 6
         self._danger_release_timers = {}
         # 소프트 위험 마스크 임계(경로/커버리지에서 회피). danger_block_threshold는 종료/패널티용.
@@ -867,11 +861,11 @@ class DynAvoidOneObjEnv(gym.Env):
                 for dx in range(-2, 3):
                     dist = max(abs(dy), abs(dx))
                     if dist == 0:
-                        radius = 0.7; val = 0.95
+                        radius = 1.2; val = 0.95
                     elif dist == 1:
-                        radius = 0.9; val = 0.9
+                        radius = 1.4; val = 0.9
                     else:
-                        radius = 1.1; val = 0.8
+                        radius = 1.6; val = 0.8
                     self.danger_zone_map._stamp_disc(
                         self.danger_zone_map.soft,
                         y + dy,
@@ -886,47 +880,100 @@ class DynAvoidOneObjEnv(gym.Env):
         self.danger_zone_map.soft.fill(0.0)
         for pts in self.danger_regions.values():
             self._stamp_danger_pts(pts)
+        # danger 생성 시점의 목표 좌표들을 3x3(반경≈1.0)으로 완만히 표시
+        orphans = []
+        for key, goals in self.danger_goal_points.items():
+            if key not in self.danger_regions:
+                orphans.append(key)
+                continue
+            for gy, gx in goals:
+                gy_i = int(round(gy)); gx_i = int(round(gx))
+                if 0 <= gy_i < self.H and 0 <= gx_i < self.W:
+                    self.danger_zone_map._stamp_disc(self.danger_zone_map.soft, gy_i, gx_i, 1.5, 0.6)
+            # 목표 지점이 같은 danger 영역과 이어지도록 centroid까지 연결
+            pts = self.danger_regions.get(key, [])
+            if pts:
+                centroid = np.mean(np.array(pts, dtype=float), axis=0)
+                for gy, gx in goals:
+                    steps = max(2, int(np.hypot(centroid[0] - gy, centroid[1] - gx)))
+                    for t in np.linspace(0.0, 1.0, steps):
+                        cy = gy + (centroid[0] - gy) * t
+                        cx = gx + (centroid[1] - gx) * t
+                        self.danger_zone_map._stamp_disc(self.danger_zone_map.soft, cy, cx, 0.8, 0.6)
+        # 생성 시점에 저장된 goal→danger 링크 재적용 (goal 변화와 무관)
+        for line in self.danger_goal_links.values():
+            for cy, cx in line:
+                self.danger_zone_map._stamp_disc(self.danger_zone_map.soft, cy, cx, 0.4, 0.7)
+        # 고아 목표 제거
+        for key in orphans:
+            self.danger_goal_points.pop(key, None)
+            self.danger_goal_links.pop(key, None)
 
     def _cleanup_danger_regions(self):
-        if not self.danger_regions:
-            return
         current = {id(obj): obj for obj in getattr(self, "dynamic_objs", [])}
-        release_radius = float(getattr(self, "danger_release_radius", 2.5))
+        release_radius = float(getattr(self, "danger_release_radius", 3.0))
         release_steps = int(getattr(self, "danger_release_steps", 5))
-        visible = getattr(self, "visible_obj_ids", set())
         removed = False
         for key in list(self.danger_regions.keys()):
             obj = current.get(key)
             if obj is None:
                 del self.danger_regions[key]
+                self.danger_goal_links.pop(key, None)
+                self.danger_goal_points.pop(key, None)
                 removed = True
                 self._danger_release_timers.pop(key, None)
                 continue
             pts = np.array(self.danger_regions[key], dtype=float)
             if pts.size == 0:
                 del self.danger_regions[key]
+                self.danger_goal_links.pop(key, None)
+                self.danger_goal_points.pop(key, None)
                 removed = True
                 self._danger_release_timers.pop(key, None)
                 continue
-            if key not in visible:
+            # 해제 판단: 해당 danger 클러스터(pts_all)와 객체 거리 기반
+            pts_all = np.array(self.danger_regions[key], dtype=float)
+            if pts_all.size == 0:
+                del self.danger_regions[key]
+                self.danger_goal_links.pop(key, None)
+                self.danger_goal_points.pop(key, None)
+                removed = True
                 self._danger_release_timers.pop(key, None)
                 continue
-            dists = np.linalg.norm(pts - np.array([obj.p[0], obj.p[1]]), axis=1)
-            if dists.size == 0 or float(dists.min()) > release_radius:
+            dmin = float(np.min(np.linalg.norm(pts_all - np.array(obj.p, dtype=float), axis=1)))
+            if dmin > release_radius:
                 cnt = self._danger_release_timers.get(key, 0) + 1
                 if cnt >= release_steps:
                     del self.danger_regions[key]
+                    self.danger_goal_links.pop(key, None)
+                    self.danger_goal_points.pop(key, None)
                     removed = True
                     self._danger_release_timers.pop(key, None)
                 else:
                     self._danger_release_timers[key] = cnt
             else:
                 self._danger_release_timers[key] = 0
-        if removed:
+        # danger_regions와 goal/링크 정합성 유지: orphan된 goal/링크 제거
+        orphan_removed = False
+        for key in list(self.danger_goal_points.keys()):
+            if key not in self.danger_regions:
+                self.danger_goal_points.pop(key, None)
+                self.danger_goal_links.pop(key, None)
+                orphan_removed = True
+        # 동적 객체가 전혀 없는 경우에도 모든 danger를 정리
+        if len(current) == 0 and (self.danger_regions or self.danger_goal_points or self.danger_goal_links):
+            self.danger_regions.clear()
+            self.danger_goal_points.clear()
+            self.danger_goal_links.clear()
+            orphan_removed = True
+
+        if removed or orphan_removed:
             self._rebuild_danger_map()
-            # sub-policy를 사용할 때는 CPP 재계획을 ESCAPE 종료 시점에만 수행
-            if not getattr(self, "use_escape_subpolicy", False):
-                self._replan_after_danger_change()
+            # danger 해제 시점에 항상 CPP를 새로 짜서 해금된 영역을 커버하게 함
+            new_cpp = self._build_cpp_path(start_rc=self.agent_rc)
+            if new_cpp:
+                self._last_replan_reason = "danger_cleanup"
+                self._apply_cpp_path(new_cpp)
 
     def _replan_after_danger_change(self):
         # use_escape_subpolicy가 켜져 있으면 ESCAPE 종료 시점에만 CPP를 재계획한다.
@@ -943,6 +990,7 @@ class DynAvoidOneObjEnv(gym.Env):
             # danger 영역만 갱신하고 sub-policy에 제어권을 넘김
             seen_ids = getattr(self, "avoid_seen_obj_ids", set())
             updated = False
+            new_links = {}
             for obj in getattr(self, "dynamic_objs", []):
                 if seen_ids and id(obj) not in seen_ids:
                     continue
@@ -950,10 +998,36 @@ class DynAvoidOneObjEnv(gym.Env):
                 if dr > getattr(self, "danger_stuck_radius", 8.0):
                     continue
                 hist = self.obj_histories.get(id(obj))
+                key = id(obj)
                 if hist and len(hist) >= 2:
-                    pts = [(float(p[0]), float(p[1])) for p in hist]
-                    self.danger_regions[id(obj)] = pts
-                    updated = True
+                    if key not in self.danger_regions:
+                        pts = [(float(p[0]), float(p[1])) for p in hist]
+                        self.danger_regions[key] = pts
+                        updated = True
+                    # 목표 스냅샷/링크는 stuck가 다시 발생해도 추가로 기록
+                    if self.wp_idx < len(self.waypoints):
+                        gx, gy = self.waypoints[self.wp_idx]
+                        goals = self.danger_goal_points.get(key, [])
+                        added_goal = False
+                        if all(np.hypot(gy - g[0], gx - g[1]) > 0.25 for g in goals):
+                            goals.append((gy, gx))
+                            self.danger_goal_points[key] = goals
+                            added_goal = True
+                        if added_goal or key not in self.danger_goal_links:
+                            pts = [(float(p[0]), float(p[1])) for p in hist] if key not in self.danger_regions else self.danger_regions[key]
+                            if pts:
+                                centroid = np.mean(np.array(pts, dtype=float), axis=0)
+                                steps = max(2, int(np.hypot(centroid[0] - gy, centroid[1] - gx)))
+                                line = []
+                                for t in np.linspace(0.0, 1.0, steps):
+                                    cy = gy + (centroid[0] - gy) * t
+                                    cx = gx + (centroid[1] - gx) * t
+                                    line.append((cy, cx))
+                                new_links[key] = line
+                    if key in self.danger_regions:
+                        updated = True
+            if new_links:
+                self.danger_goal_links.update(new_links)
             if updated:
                 self._rebuild_danger_map()
             # danger zone이 없어도 stuck이면 ESCAPE를 켜 주자
@@ -975,6 +1049,7 @@ class DynAvoidOneObjEnv(gym.Env):
 
         seen_ids = getattr(self, "avoid_seen_obj_ids", set())
         updated = False
+        new_links = {}
         for obj in getattr(self, "dynamic_objs", []):
             if seen_ids and id(obj) not in seen_ids:
                 continue
@@ -982,11 +1057,33 @@ class DynAvoidOneObjEnv(gym.Env):
             if dr > getattr(self, "danger_stuck_radius", 8.0):
                 continue
             hist = self.obj_histories.get(id(obj))
+            key = id(obj)
             if hist and len(hist) >= 2:
-                pts = [(float(p[0]), float(p[1])) for p in hist]
-                self.danger_regions[id(obj)] = pts
+                pts_new = [(float(p[0]), float(p[1])) for p in hist]
+                if key in self.danger_regions:
+                    self.danger_regions[key].extend(pts_new)
+                else:
+                    self.danger_regions[key] = pts_new
                 updated = True
+                if self.wp_idx < len(self.waypoints):
+                    gx, gy = self.waypoints[self.wp_idx]
+                    goals = self.danger_goal_points.get(key, [])
+                    if all(np.hypot(gy - g[0], gx - g[1]) > 0.25 for g in goals):
+                        goals.append((gy, gx))
+                        self.danger_goal_points[key] = goals
+                    pts_all = self.danger_regions.get(key, pts_new)
+                    if pts_all:
+                        centroid = np.mean(np.array(pts_all, dtype=float), axis=0)
+                        steps = max(2, int(np.hypot(centroid[0] - gy, centroid[1] - gx)))
+                        line = []
+                        for t in np.linspace(0.0, 1.0, steps):
+                            cy = gy + (centroid[0] - gy) * t
+                            cx = gx + (centroid[1] - gx) * t
+                            line.append((cy, cx))
+                        new_links[key] = line
 
+        if new_links:
+            self.danger_goal_links.update(new_links)
         if updated:
             self._rebuild_danger_map()
 
@@ -1075,18 +1172,13 @@ class DynAvoidOneObjEnv(gym.Env):
         move_score = _clip((self.stuck_move_min_m - mean_move) / max(self.stuck_move_min_m, 1e-6))
         score_sum = block_score + prog_score + eff_score + move_score
 
-        # 이전(보수적) 로직:
+        # 보수적 로직: 4개 중 3개 이상 + 점수 상향 + 정체 + 목표까지 거리 조건
         self._stuck_state = (
-            satisfied >= 2 and
-            score_sum >= self.stuck_score_min and
+            satisfied >= 3 and
+            score_sum >= (self.stuck_score_min + 0.3) and
             stagnating and
             far_from_goal
         )
-        # 완화 로직: 4개 조건 중 2개 이상이면서 정체(stagnating)거나 목표까지 멀면 stuck
-        # self._stuck_state = (
-        #     satisfied >= 2 and
-        #     (stagnating or far_from_goal)
-        # )
         # 추가로 일정 스텝(기본 18) 목표 미도달 시 stuck 처리
         if self.goal_stagnation_timer >= getattr(self, "stuck_goal_miss_steps", 23):
             self._stuck_state = True
@@ -1160,6 +1252,8 @@ class DynAvoidOneObjEnv(gym.Env):
         self.visible_obj_ids.clear()
         self.avoid_seen_obj_ids.clear()
         self.danger_regions.clear()
+        self.danger_goal_points.clear()
+        self.danger_goal_links.clear()
         self._danger_release_timers.clear()
         self.goal_stagnation_timer = 0
 
@@ -1476,6 +1570,13 @@ class DynAvoidOneObjEnv(gym.Env):
                     # 기존: reward -= 2.0; done = True
                     # 변경: 즉시 종료하지 않고 큰 패널티만 부여
                     reward -= 2.0
+        # ESCAPE 모드일 때: danger에서 벗어나면 추가 보상, 안에 머무르면 소폭 패널티
+        if self.use_escape_subpolicy and getattr(self, "escape_active", False):
+            inside_soft = self._agent_inside_soft_danger()
+            if not inside_soft:
+                reward += 0.5
+            else:
+                reward -= 0.05
 
         # 보상 클리핑 폭 확대
         reward = float(np.clip(reward, -2.5, 2.5))

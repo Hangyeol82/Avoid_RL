@@ -85,7 +85,7 @@ def make_spawn_fn(obj_k: int, type_probs: Dict[str, float]):
     from env.moving_object import MovingObj
     from utils_timing import estimate_robot_timeline
 
-    # 확률 누적
+    # 확률 
     keys = ["cv", "patrol", "ou"]
     probs = np.array([type_probs.get(k, 0.0) for k in keys], dtype=float)
     probs = probs / max(probs.sum(), 1e-9)
