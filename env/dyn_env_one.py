@@ -128,6 +128,8 @@ class DynAvoidOneObjEnv(gym.Env):
         self.danger_release_radius = 3.0
         self.danger_release_steps = 6
         self._danger_release_timers = {}
+        self._last_danger_feats = np.zeros(2, dtype=np.float32)
+        self._last_danger_lidar = np.zeros(self.danger_lidar_bins, dtype=np.float32)
         # 소프트 위험 마스크 임계(경로/커버리지에서 회피). danger_block_threshold는 종료/패널티용.
         self.danger_soft_block = 0.30
         self.goal_timeout_steps = 120
@@ -254,16 +256,23 @@ class DynAvoidOneObjEnv(gym.Env):
         return float(np.arctan2(-dy_cells, dx_cells))
 
     def _danger_lidar(self, bins=16, max_range=6.0):
+        """
+        위험 경계(soft < threshold)까지의 상대 거리.
+        - 현재 이미 안전하면 1.0
+        - 위험 영역 안이면, 가장 가까운 안전셀까지의 거리로 1 - (dist/max_range)
+        - 끝까지 위험이면 0.0
+        """
         if self.danger_zone_map is None or getattr(self.danger_zone_map, "soft", None) is None:
-            return np.zeros(bins, dtype=np.float32)
+            return np.ones(bins, dtype=np.float32)
         soft = self.danger_zone_map.soft
+        thr = float(getattr(self, "danger_soft_block", 0.3))
         angles = np.linspace(-np.pi, np.pi, bins, endpoint=False)
         ry, rx = self.agent_rc
         H, W = soft.shape
         readings = np.zeros(bins, dtype=np.float32)
         steps = int(max_range * 4)  # 세밀한 샘플링
         for i, ang in enumerate(angles):
-            val = 0.0
+            exit_found = False
             for t in range(1, steps + 1):
                 dy = np.sin(ang) * (t * max_range / steps)
                 dx = np.cos(ang) * (t * max_range / steps)
@@ -271,10 +280,14 @@ class DynAvoidOneObjEnv(gym.Env):
                 xx = int(round(rx + dx))
                 if not (0 <= yy < H and 0 <= xx < W):
                     break
-                val = max(val, float(soft[yy, xx]))
-                if val >= 0.99:
+                if float(soft[yy, xx]) < thr:
+                    dist = np.hypot(dy, dx)
+                    readings[i] = max(0.0, 1.0 - dist / max_range)
+                    exit_found = True
                     break
-            readings[i] = val
+            if not exit_found:
+                # 현재 이미 안전하면 1.0, 아니면 0.0
+                readings[i] = 1.0 if float(soft[int(round(ry)), int(round(rx))]) < thr else 0.0
         return readings
     # ----------------------- 브레젠험: 가림막 판정 -----------------------
     @staticmethod
@@ -477,6 +490,9 @@ class DynAvoidOneObjEnv(gym.Env):
                     danger_near = float(np.clip(np.max(patch), 0.0, 1.0)) if patch.size > 0 else danger_here
                     danger_feats[:] = [danger_here, danger_near]
         danger_lidar = self._danger_lidar(bins=getattr(self, "danger_lidar_bins", 16), max_range=6.0)
+        # 로그용 캐시
+        self._last_danger_feats = danger_feats.copy()
+        self._last_danger_lidar = danger_lidar.copy()
 
         # 캐시
         self._last_d_goal_m = float(d_goal_m)
@@ -1448,6 +1464,10 @@ class DynAvoidOneObjEnv(gym.Env):
                     closeness_norm = (DANGER - dist_to_obj_cells) / max(DANGER, 1e-6)
                     if closeness_norm > 0:
                         reward -= self.prox_pen_scale * (closeness_norm ** self.prox_pen_pow)
+                    # 매우 근접(충돌 직전) 시 추가 강한 패널티
+                    if dist_to_obj_cells < 1.5:
+                        extra_close_pen = (1.5 - dist_to_obj_cells) * 0.6  # 최대 약 0.9 감점
+                        reward -= extra_close_pen
 
             # 목표 진행도 보상(AVOID 중에도 전진 유도)
             gx, gy = self.waypoints[self.wp_idx] if self.wp_idx < len(self.waypoints) else self.waypoints[-1]
@@ -1511,6 +1531,11 @@ class DynAvoidOneObjEnv(gym.Env):
         info["backtrack_rate"] = backrate
         info["prog_ratio"] = prog_ratio
         info["last_replan_reason"] = self._last_replan_reason
+        # 디버그용 danger 관측 로그(마지막 obs 기준)
+        info["danger_here"] = float(self._last_danger_feats[0]) if self._last_danger_feats is not None else 0.0
+        info["danger_near"] = float(self._last_danger_feats[1]) if self._last_danger_feats is not None else 0.0
+        info["danger_lidar_max"] = float(np.max(self._last_danger_lidar)) if self._last_danger_lidar is not None else 0.0
+        info["escape_active"] = bool(getattr(self, "escape_active", False))
 
         prev_stuck = bool(self._stuck_state)
         self._update_stuck_state(np.array(goal_xy_cells, dtype=float), info)
@@ -1568,8 +1593,8 @@ class DynAvoidOneObjEnv(gym.Env):
                 sev = float(self.danger_zone_map.soft[yy, xx])
                 if sev >= self.danger_block_threshold:
                     # 기존: reward -= 2.0; done = True
-                    # 변경: 즉시 종료하지 않고 큰 패널티만 부여
-                    reward -= 2.0
+                    # 변경: 즉시 종료하지 않고 패널티만 부여(강도를 낮춰 동적 객체 회피를 우선)
+                    reward -= 0.5
         # ESCAPE 모드일 때: danger에서 벗어나면 추가 보상, 안에 머무르면 소폭 패널티
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
             inside_soft = self._agent_inside_soft_danger()

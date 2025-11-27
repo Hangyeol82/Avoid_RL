@@ -64,6 +64,10 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
             logits, _ = active_model(obs_t)
             action = torch.argmax(logits, dim=-1).item()
         obs, reward, done, trunc, info = env.step(action)
+        # 터미널 디버그 출력(10스텝마다)
+        if step % 10 == 0:
+            print(f"step {step} mode={info.get('mode')} esc={info.get('escape_active')} "
+                  f"danger h/n/l={info.get('danger_here',0):.2f}/{info.get('danger_near',0):.2f}/{info.get('danger_lidar_max',0):.2f}")
 
         ax.clear()
         ax.imshow(grid, cmap="Greys", origin="upper")
@@ -101,6 +105,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
         ax.set_title(title_str, loc="left", fontsize=10)
 
         crit_text = summarize_block(info)
+        # danger 관측 디버그
+        dh = info.get("danger_here", 0.0)
+        dn = info.get("danger_near", 0.0)
+        dl = info.get("danger_lidar_max", 0.0)
+        crit_text += f"\nDanger here/near/lidar_max: {dh:.2f}/{dn:.2f}/{dl:.2f}"
         last_replan = info.get("last_replan_reason", None)
         if last_replan:
             crit_text += f"\nReplan: {last_replan}"
@@ -121,11 +130,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
     
 def main():
     parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
-    parser.add_argument("--ckpt", default="checkpoints_integrated/main_iter700.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_integrated/escape_iter700.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter500.pt")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=3246246)
+    parser.add_argument("--seed", type=int, default=345)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)
