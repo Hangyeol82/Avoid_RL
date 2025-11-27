@@ -13,7 +13,7 @@ from rl.ppo import PPOConfig, PPOTrainer
 # =============================================================================
 #  전이학습 설정: 불러올 모델 경로 (없으면 None)
 # =============================================================================
-PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/ppo_dyn_iter10000.pt"
+PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/ppo_dyn_iter500.pt"
 # =============================================================================
 
 
@@ -85,7 +85,7 @@ def make_spawn_fn(obj_k: int, type_probs: Dict[str, float]):
     from env.moving_object import MovingObj
     from utils_timing import estimate_robot_timeline
 
-    # 확률 누적
+    # 확률 
     keys = ["cv", "patrol", "ou"]
     probs = np.array([type_probs.get(k, 0.0) for k in keys], dtype=float)
     probs = probs / max(probs.sum(), 1e-9)
@@ -300,10 +300,10 @@ def main():
     cfg = PPOConfig(
         obs_dim=obs_dim,
         act_dim=act_dim,
-        rollout_steps=2048,
-        lr=3e-4,
+        rollout_steps=4096,
+        lr=2e-4,
         epochs=10,
-        batch_size=256,
+        batch_size=512,
         clip_eps=0.2,
         vf_coef=0.5,
         ent_coef=0.01,
@@ -312,8 +312,8 @@ def main():
         gae_lambda=0.95,
         device="cpu",
         seed=0,
-        hidden_sizes=(256,256,256),
-        feat_dim=256
+        hidden_sizes=(512,512,256),
+        feat_dim=384
     )
 
     trainer = PPOTrainer(env, cfg)

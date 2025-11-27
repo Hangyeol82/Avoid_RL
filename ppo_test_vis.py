@@ -1,11 +1,18 @@
 # ppo_test_vis.py
 import os, random
+import argparse
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
 from env.dyn_env_one import DynAvoidOneObjEnv
 from rl.network import ActorCritic
+
+# 모델 아키텍처 기본값 (통합 학습 스크립트와 동일)
+MAIN_HIDDEN = (512, 512, 256)
+MAIN_FEAT   = 384
+ESC_HIDDEN  = (512, 512, 256)
+ESC_FEAT    = 384
 
 
 def load_model(model, path, device="cpu"):
@@ -39,7 +46,7 @@ def summarize_block(info):
     return line1 + "\n" + line2 + "\n" + line3
 
 
-def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=1000, seed=42):
+def visualize_episode(env, model, escape_model=None, device="cpu", render_interval=0.05, max_steps=1000, seed=42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     obs, _ = env.reset()
     done = False; trunc = False; step = 0
@@ -50,11 +57,20 @@ def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=
 
     while not (done or trunc) and step < max_steps:
         step += 1
+        use_escape_policy = escape_model is not None and getattr(env, "escape_active", False)
+        active_model = escape_model if use_escape_policy else model
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            logits, _ = model(obs_t)
+            logits, _ = active_model(obs_t)
             action = torch.argmax(logits, dim=-1).item()
         obs, reward, done, trunc, info = env.step(action)
+        # 터미널 디버그 출력(10스텝마다)
+        if step % 10 == 0:
+            print(
+                f"step {step} mode={info.get('mode')} esc={info.get('escape_active')} "
+                f"danger h/n/l={info.get('danger_here',0):.2f}/{info.get('danger_near',0):.2f}/{info.get('danger_lidar_max',0):.2f} "
+                f"rays min/mean/max={info.get('ray_min',0):.2f}/{info.get('ray_mean',0):.2f}/{info.get('ray_max',0):.2f}"
+            )
 
         ax.clear()
         ax.imshow(grid, cmap="Greys", origin="upper")
@@ -84,7 +100,7 @@ def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=
             ax.scatter(obj.p[1], obj.p[0], c="red", s=50, label="Obj" if i==0 else None)
 
         mode = info.get('mode', '-')
-        title_str = f"Step {step} | Mode={mode} | R={reward:.2f}"
+        title_str = f"Step {step} | Mode={mode} | Policy={'ESC' if use_escape_policy else 'MAIN'} | R={reward:.2f}"
         if mode == "AVOID":
             title_str += f" | Policy: {action_map.get(action,'?')}"
         if stuck_state:
@@ -92,6 +108,14 @@ def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=
         ax.set_title(title_str, loc="left", fontsize=10)
 
         crit_text = summarize_block(info)
+        # danger 관측 디버그
+        dh = info.get("danger_here", 0.0)
+        dn = info.get("danger_near", 0.0)
+        dl = info.get("danger_lidar_max", 0.0)
+        crit_text += f"\nDanger here/near/lidar_max: {dh:.2f}/{dn:.2f}/{dl:.2f}"
+        last_replan = info.get("last_replan_reason", None)
+        if last_replan:
+            crit_text += f"\nReplan: {last_replan}"
         ax.text(
             0.01, 0.01, crit_text,
             transform=ax.transAxes,
@@ -106,28 +130,41 @@ def visualize_episode(env, model, device="cpu", render_interval=0.05, max_steps=
 
     plt.ioff(); plt.show()
 
-
+    
 def main():
-    seed = 123
+    parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
+    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter400.pt")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter400.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--grid-path", default="map_grid.npy")
+    parser.add_argument("--waypoints-path", default="waypoints.npy")
+    parser.add_argument("--seed", type=int, default=63345)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--render-interval", type=float, default=0.01)
+    parser.add_argument("--max-steps", type=int, default=1500)
+    args = parser.parse_args()
+
+    seed = args.seed
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
-    # 사용자 맵/웨이포인트
-    grid_path = "map_grid.npy"; wps_path = "waypoints.npy"
-    if not (os.path.exists(grid_path) and os.path.exists(wps_path)):
+    if not (os.path.exists(args.grid_path) and os.path.exists(args.waypoints_path)):
         raise FileNotFoundError("map_grid.npy / waypoints.npy 가 필요합니다.")
-    grid = np.load(grid_path); wps = np.load(wps_path)
+    grid = np.load(args.grid_path); wps = np.load(args.waypoints_path)
 
-    env = DynAvoidOneObjEnv(grid=grid, waypoints=wps, seed=384731, cell_size_m=0.20)
+    use_escape = args.escape_ckpt is not None
+    env = DynAvoidOneObjEnv(grid=grid, waypoints=wps, seed=seed, cell_size_m=0.20, use_escape_subpolicy=use_escape)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
 
-    device = "cpu"
-    model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=(256,256,256), feat_dim=256).to(device)
+    device = args.device
+    model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=MAIN_HIDDEN, feat_dim=MAIN_FEAT).to(device)
+    load_model(model, args.ckpt, device)
 
-    ckpt_path = "checkpoints_dyn/ppo_dyn_iter500.pt"
-    load_model(model, ckpt_path, device)
+    escape_model = None
+    if use_escape:
+        escape_model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=ESC_HIDDEN, feat_dim=ESC_FEAT).to(device)
+        load_model(escape_model, args.escape_ckpt, device)
 
-    visualize_episode(env, model, device=device, render_interval=0.01, max_steps=1500, seed=seed)
+    visualize_episode(env, model, escape_model=escape_model, device=device, render_interval=args.render_interval, max_steps=args.max_steps, seed=seed)
 
 
 if __name__ == "__main__":
