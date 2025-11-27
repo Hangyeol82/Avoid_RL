@@ -1535,6 +1535,9 @@ class DynAvoidOneObjEnv(gym.Env):
         info["danger_here"] = float(self._last_danger_feats[0]) if self._last_danger_feats is not None else 0.0
         info["danger_near"] = float(self._last_danger_feats[1]) if self._last_danger_feats is not None else 0.0
         info["danger_lidar_max"] = float(np.max(self._last_danger_lidar)) if self._last_danger_lidar is not None else 0.0
+        info["ray_min"] = float(np.min(self._last_rays)) if self._last_rays is not None else 0.0
+        info["ray_mean"] = float(np.mean(self._last_rays)) if self._last_rays is not None else 0.0
+        info["ray_max"] = float(np.max(self._last_rays)) if self._last_rays is not None else 0.0
         info["escape_active"] = bool(getattr(self, "escape_active", False))
 
         prev_stuck = bool(self._stuck_state)

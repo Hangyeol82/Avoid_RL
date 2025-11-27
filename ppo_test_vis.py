@@ -66,8 +66,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
         obs, reward, done, trunc, info = env.step(action)
         # 터미널 디버그 출력(10스텝마다)
         if step % 10 == 0:
-            print(f"step {step} mode={info.get('mode')} esc={info.get('escape_active')} "
-                  f"danger h/n/l={info.get('danger_here',0):.2f}/{info.get('danger_near',0):.2f}/{info.get('danger_lidar_max',0):.2f}")
+            print(
+                f"step {step} mode={info.get('mode')} esc={info.get('escape_active')} "
+                f"danger h/n/l={info.get('danger_here',0):.2f}/{info.get('danger_near',0):.2f}/{info.get('danger_lidar_max',0):.2f} "
+                f"rays min/mean/max={info.get('ray_min',0):.2f}/{info.get('ray_mean',0):.2f}/{info.get('ray_max',0):.2f}"
+            )
 
         ax.clear()
         ax.imshow(grid, cmap="Greys", origin="upper")
@@ -130,11 +133,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
     
 def main():
     parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
-    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter500.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter400.pt")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter400.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=345)
+    parser.add_argument("--seed", type=int, default=63345)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)
