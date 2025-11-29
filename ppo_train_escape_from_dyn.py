@@ -7,6 +7,7 @@ from torch.distributions import Categorical
 from env.dyn_env_one import DynAvoidOneObjEnv
 from env.env import make_map_30
 from rl.ppo import PPOConfig, PPOTrainer
+from rl.network import ActorCritic
 
 """
 python3 ppo_train_escape_from_dyn.py \
@@ -23,18 +24,22 @@ def parse_args():
     p.add_argument("--random-map", action="store_true")
     p.add_argument("--map-size", type=int, default=30)
     p.add_argument("--regen-map-interval", type=int, default=10, help="이 주기(업데이트 기준)마다 새 맵 생성(0이면 고정)")
+    p.add_argument("--overwrite-base", action="store_true", help="맵 재생성 시 map_grid.npy 덮어쓰기")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cpu")
     p.add_argument("--updates", type=int, default=300)
     p.add_argument("--rollout-steps", type=int, default=4096)
-    p.add_argument("--save-interval", type=int, default=100)
+    p.add_argument("--save-interval", type=int, default=10)
     p.add_argument("--out-dir", default="checkpoints_escape_from_dyn")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
-    p.add_argument("--feat-dim", type=int, default=256)
+    p.add_argument("--hidden-sizes", type=int, nargs="+", default=[640, 640, 320])
+    p.add_argument("--feat-dim", type=int, default=512)
     p.add_argument("--pretrained", default=None)
+    p.add_argument("--main-policy", default="checkpoints_dyn/ppo_dyn_iter150.pt")
+    p.add_argument("--main-hidden-sizes", type=int, nargs="+", default=[640, 640, 320])
+    p.add_argument("--main-feat-dim", type=int, default=512)
     p.add_argument("--cell-size", type=float, default=0.20)
     p.add_argument("--pre-stuck-steps", type=int, default=12, help="stuck 직전 포함할 스텝 수")
     p.add_argument("--escape-release-steps", type=int, default=3, help="danger를 벗어난 뒤 기록 종료까지 유지할 스텝")
@@ -72,7 +77,7 @@ def switch_env(trainer: PPOTrainer, env, device):
     trainer._curr_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
 
 
-def collect_escape_segments(trainer: PPOTrainer, cfg, pre_steps=12, escape_release_steps=3):
+def collect_escape_segments(trainer: PPOTrainer, cfg, main_policy=None, pre_steps=12, escape_release_steps=3):
     env = trainer.env
     model = trainer.model
     buffer = trainer.buffer
@@ -95,7 +100,16 @@ def collect_escape_segments(trainer: PPOTrainer, cfg, pre_steps=12, escape_relea
     while collected < cfg.rollout_steps and buffer.ptr < max_cap:
         obs_t = curr_obs.unsqueeze(0)
         with torch.no_grad():
-            logits, value = model(obs_t)
+            # recording(stuck/escape) 중이면 학습 대상 모델(Escape Policy) 사용
+            # 아니면 메인 정책(Main Policy) 사용 (없으면 학습 모델 사용)
+            if recording:
+                logits, value = model(obs_t)
+            else:
+                if main_policy:
+                    logits, value = main_policy(obs_t)
+                else:
+                    logits, value = model(obs_t)
+
             value = value.squeeze(0).squeeze(-1)
             dist = Categorical(logits=logits.squeeze(0))
             action = dist.sample()
@@ -206,6 +220,31 @@ def main():
         else:
             print(f"[WARN] pretrained not found: {args.pretrained}")
 
+    # 메인 정책 로드 (일반 주행용)
+    main_policy = None
+    if args.main_policy:
+        if os.path.exists(args.main_policy):
+            print(f"[INFO] Loading Main Policy from {args.main_policy}")
+            cfg_main = PPOConfig(
+                obs_dim=env.observation_space.shape[0],
+                act_dim=env.action_space.n,
+                hidden_sizes=tuple(args.main_hidden_sizes),
+                feat_dim=args.main_feat_dim,
+                device=args.device
+            )
+            # ActorCritic 초기화 시 PPOConfig 객체가 아니라 개별 인자를 전달해야 함
+            main_policy = ActorCritic(
+                obs_dim=cfg_main.obs_dim,
+                act_dim=cfg_main.act_dim,
+                hidden_sizes=cfg_main.hidden_sizes,
+                feat_dim=cfg_main.feat_dim
+            ).to(args.device)
+            state_main = torch.load(args.main_policy, map_location=args.device)
+            main_policy.load_state_dict(state_main, strict=False)
+            main_policy.eval()
+        else:
+            print(f"[WARN] Main Policy file not found: {args.main_policy}")
+
     print(f"[INFO] obs_dim={cfg.obs_dim}, act_dim={cfg.act_dim}, device={args.device}")
     print(f"[INFO] escape data only: pre_stuck_steps={args.pre_stuck_steps}")
 
@@ -215,10 +254,17 @@ def main():
             new_env = build_env(args, seed=map_seed)
             switch_env(trainer, new_env, trainer.device)
             print(f"[INFO] regenerated map at iter {it} (seed={map_seed})")
+            
+            # 맵 재생성 시 파일 덮어쓰기 (옵션)
+            if args.overwrite_base:
+                np.save(args.grid_path, new_env.grid)
+                np.save(args.waypoints_path, new_env.waypoints)
+                print(f"[ENV] Base files overwritten: {args.grid_path}, {args.waypoints_path}")
 
         steps = collect_escape_segments(
             trainer,
             cfg,
+            main_policy=main_policy,
             pre_steps=args.pre_stuck_steps,
             escape_release_steps=args.escape_release_steps,
         )

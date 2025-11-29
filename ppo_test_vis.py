@@ -8,11 +8,11 @@ import matplotlib.pyplot as plt
 from env.dyn_env_one import DynAvoidOneObjEnv
 from rl.network import ActorCritic
 
-# 모델 아키텍처 기본값 (통합 학습 스크립트와 동일)
-MAIN_HIDDEN = (512, 512, 256)
-MAIN_FEAT   = 384
-ESC_HIDDEN  = (512, 512, 256)
-ESC_FEAT    = 384
+# 모델 아키텍처 기본값 (통합 random 학습 스크립트와 동일)
+MAIN_HIDDEN = (640, 640, 320)
+MAIN_FEAT   = 512
+ESC_HIDDEN  = (640, 640, 320)
+ESC_FEAT    = 512
 
 
 def load_model(model, path, device="cpu"):
@@ -101,8 +101,8 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
 
         mode = info.get('mode', '-')
         title_str = f"Step {step} | Mode={mode} | Policy={'ESC' if use_escape_policy else 'MAIN'} | R={reward:.2f}"
-        if mode == "AVOID":
-            title_str += f" | Policy: {action_map.get(action,'?')}"
+        # 항상 정책이 선택한 액션을 표시
+        title_str += f" | Action: {action_map.get(action,'?')}"
         if stuck_state:
             title_str += " | STUCK"
         ax.set_title(title_str, loc="left", fontsize=10)
@@ -133,11 +133,11 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
     
 def main():
     parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
-    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter400.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter400.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--ckpt", default="checkpoints_dyn/ppo_dyn_iter150.pt", help="메인 정책 체크포인트 경로")
+    parser.add_argument("--escape-ckpt", default="checkpoints_escape_from_dyn/escape_from_dyn_iter200.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=63345)
+    parser.add_argument("--seed", type=int, default=346575)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=1500)

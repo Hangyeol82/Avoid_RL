@@ -71,13 +71,23 @@ class DynAvoidOneObjEnv(gym.Env):
 
         # ----- 동적 객체 관측 슬롯 -----
         self.max_objs = int(max(1, max_objs))
-        self.obj_feat_len = 5  # [dist_norm, cos, sin, speed_norm, ttc_norm]
+        self.obj_feat_len = 7  # [dist_norm, cos(pos), sin(pos), speed_norm, ttc_norm, cos(move), sin(move)] (5->7 증가)
         self.danger_feat_len = 2  # [current danger, nearby max]
         self.danger_lidar_bins = 16
+        # 주변 맵 패치 크기(홀수)
+        self.patch_size = 11
 
         # ----- 액션/관측 공간 -----
         self.action_space = spaces.Discrete(5)  # 0=상,1=좌,2=하,3=우,4=정지
-        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len + self.danger_lidar_bins
+        self.obs_dim = (
+            3  # goal
+            + (self.obj_feat_len * self.max_objs)
+            + self.ray_count
+            + self.danger_feat_len
+            + self.danger_lidar_bins
+            + (self.patch_size * self.patch_size)  # 정적 패치
+            + (self.patch_size * self.patch_size)  # danger 패치
+        )
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
 
         # 이동 벡터(상,좌,하,우)
@@ -255,6 +265,42 @@ class DynAvoidOneObjEnv(gym.Env):
     def _goal_angle_math(self, dy_cells, dx_cells):
         return float(np.arctan2(-dy_cells, dx_cells))
 
+    def _static_patch(self, patch_size=11):
+        """로봇 중심 주변 정적 패치(벽=1, 빈칸=0), 맵 밖은 벽으로 패딩."""
+        H, W = self.grid.shape
+        r = patch_size // 2
+        cy = int(round(self.agent_rc[0]))
+        cx = int(round(self.agent_rc[1]))
+        y0 = max(0, cy - r)
+        y1 = min(H, cy + r + 1)
+        x0 = max(0, cx - r)
+        x1 = min(W, cx + r + 1)
+        patch = np.ones((patch_size, patch_size), dtype=np.float32)  # 기본 벽
+        py0 = r - (cy - y0)
+        px0 = r - (cx - x0)
+        patch[py0:py0 + (y1 - y0), px0:px0 + (x1 - x0)] = (self.grid[y0:y1, x0:x1] == 1).astype(np.float32)
+        return patch.flatten()
+
+    def _danger_patch(self, patch_size=11, thr=0.3):
+        """로봇 중심 주변 danger soft 패치, threshold로 0~1 클립."""
+        H, W = self.grid.shape
+        r = patch_size // 2
+        cy = int(round(self.agent_rc[0]))
+        cx = int(round(self.agent_rc[1]))
+        patch = np.zeros((patch_size, patch_size), dtype=np.float32)
+        if self.danger_zone_map is None or getattr(self.danger_zone_map, "soft", None) is None:
+            return patch.flatten()
+        soft = self.danger_zone_map.soft
+        y0 = max(0, cy - r)
+        y1 = min(H, cy + r + 1)
+        x0 = max(0, cx - r)
+        x1 = min(W, cx + r + 1)
+        py0 = r - (cy - y0)
+        px0 = r - (cx - x0)
+        patch[py0:py0 + (y1 - y0), px0:px0 + (x1 - x0)] = soft[y0:y1, x0:x1]
+        patch = np.clip(patch / max(thr, 1e-6), 0.0, 1.0)
+        return patch.flatten()
+
     def _danger_lidar(self, bins=16, max_range=6.0):
         """
         위험 경계(soft < threshold)까지의 상대 거리.
@@ -279,6 +325,8 @@ class DynAvoidOneObjEnv(gym.Env):
                 yy = int(round(ry + dy))
                 xx = int(round(rx + dx))
                 if not (0 <= yy < H and 0 <= xx < W):
+                    break
+                if self.grid[yy, xx] == 1:  # 벽에 막히면 탐색 중단
                     break
                 if float(soft[yy, xx]) < thr:
                     dist = np.hypot(dy, dx)
@@ -455,17 +503,87 @@ class DynAvoidOneObjEnv(gym.Env):
             objs_metrics.sort(key=lambda t: (t[0], t[1], t[2]))
             for j in range(min(self.max_objs, len(objs_metrics))):
                 _, _, _, angle, speed_norm, d_norm, ttc_norm = objs_metrics[j]
-                per_obj_feats.extend([
-                    d_norm,
-                    float(np.cos(angle)),
-                    float(np.sin(angle)),
-                    speed_norm,
-                    ttc_norm,
-                ])
+                
+                # (수정) 관측값에 객체의 이동 방향(cos, sin) 추가
+                # angle은 로봇 기준 상대 각도이므로, 객체의 절대 이동 방향을 계산해야 함
+                # 하지만 여기서는 로봇 기준 상대 속도 벡터를 사용하는 것이 더 유용할 수 있음
+                # 현재 구현: angle = atan2(obj_y - robot_y, obj_x - robot_x) -> 객체의 위치 방향
+                
+                # 객체의 이동 방향 벡터 (속도 벡터)
+                # obj.v는 (vy, vx) 형태
+                # 로봇 기준이 아니라 월드 기준 절대 방향을 제공하거나, 로봇 기준 상대 속도를 제공해야 함
+                # 여기서는 월드 기준 이동 방향(cos, sin)을 추가하는 것으로 가정 (관성 정보 제공)
+                
+                # 해당 객체 찾기 (objs_metrics에는 객체 참조가 없으므로 다시 매핑 필요)
+                # 하지만 위 루프에서 objs_metrics를 만들 때 객체 정보를 잃어버림.
+                # 구조를 바꿔서 객체 참조를 유지해야 함.
+                pass
 
-        # 패딩
+        # (재구현) 객체별 특징 추출 루프
+        per_obj_feats = []
+        objs_metrics = []
+        
+        visible_ids = set()
+        for obj in getattr(self, "dynamic_objs", []):
+            # ... (기존 가림막 체크 로직) ...
+            is_occluded = False
+            if self.consider_occlusion_in_obs:
+                is_occluded = self.is_occluded_by_static(self.agent_rc, obj.p)
+            
+            if is_occluded:
+                continue
+                
+            visible_ids.add(id(obj))
+            
+            # 상대 위치 벡터
+            dy = obj.p[0] - ry
+            dx = obj.p[1] - rx
+            dist_cells = float(np.hypot(dy, dx))
+            dist_m = dist_cells * self.cell_size_m
+            
+            # 위치 방향 (로봇 기준)
+            angle = float(np.arctan2(dy, dx))
+            
+            # 속도 크기
+            speed_cells = float(np.linalg.norm(obj.v))
+            speed_m = speed_cells * self.cell_size_m
+            
+            # TTC
+            v_rel_m = speed_m # 단순화 (정확한 TTC는 상대 속도 필요)
+            if v_rel_m > 1e-3:
+                ttc = (dist_m - self.cell_size_m) / v_rel_m
+            else:
+                ttc = float("inf")
+            
+            # 정규화
+            d_norm = float(np.clip(dist_m / self.R_obj_m, 0.0, 1.0))
+            speed_norm = float(np.clip(speed_m / self.vmax_obj, 0.0, 1.0))
+            ttc_capped = float(np.clip(ttc, 0.0, self.T_cap_s))
+            ttc_norm = ttc_capped / self.T_cap_s
+            
+            # 이동 방향 (월드 기준)
+            if speed_cells > 1e-6:
+                move_angle = float(np.arctan2(obj.v[0], obj.v[1])) # vy, vx
+                move_cos = float(np.cos(move_angle))
+                move_sin = float(np.sin(move_angle))
+            else:
+                move_cos = 0.0
+                move_sin = 0.0
+                
+            objs_metrics.append({
+                "sort_key": (ttc_capped >= self.T_cap_s - 1e-9, ttc_capped, dist_cells),
+                "feats": [d_norm, float(np.cos(angle)), float(np.sin(angle)), speed_norm, ttc_norm, move_cos, move_sin]
+            })
+
+        # 정렬 및 추출
+        objs_metrics.sort(key=lambda x: x["sort_key"])
+        
+        for j in range(min(self.max_objs, len(objs_metrics))):
+            per_obj_feats.extend(objs_metrics[j]["feats"])
+
+        # 패딩 (7개 feature로 증가)
         while len(per_obj_feats) < self.obj_feat_len * self.max_objs:
-            per_obj_feats.extend([1.0, 0.0, 0.0, 0.0, 1.0])
+            per_obj_feats.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]) # move_cos, move_sin 패딩 추가
 
         # 라이다(정적)
         origin = (ry, rx)
@@ -494,17 +612,31 @@ class DynAvoidOneObjEnv(gym.Env):
         self._last_danger_feats = danger_feats.copy()
         self._last_danger_lidar = danger_lidar.copy()
 
+        # 주변 패치
+        static_patch = self._static_patch(patch_size=getattr(self, "patch_size", 11))
+        danger_patch = self._danger_patch(patch_size=getattr(self, "patch_size", 11), thr=getattr(self, "danger_soft_block", 0.3))
+
         # 캐시
         self._last_d_goal_m = float(d_goal_m)
         self._last_goal_angle_math = self._goal_angle_math(dy_cells, dx_cells)
         self._last_rays = rays.copy()
         if len(objs_metrics) > 0:
-            self._last_ttc = float(objs_metrics[0][-1])
+            # objs_metrics[0]는 이제 딕셔너리입니다. "feats" 리스트의 5번째 요소(인덱스 4)가 ttc_norm입니다.
+            # feats: [d_norm, cos, sin, speed_norm, ttc_norm, move_cos, move_sin]
+            self._last_ttc = float(objs_metrics[0]["feats"][4])
         else:
             self._last_ttc = 1.0
         self.visible_obj_ids = visible_ids
 
-        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats, danger_lidar], axis=0)
+        obs = np.concatenate([
+            goal_feats,
+            np.array(per_obj_feats, dtype=np.float32),
+            rays,
+            danger_feats,
+            danger_lidar,
+            static_patch,
+            danger_patch
+        ], axis=0)
         assert obs.shape[0] == self.obs_dim
         return obs
 
@@ -1430,7 +1562,7 @@ class DynAvoidOneObjEnv(gym.Env):
                 executed_action = int(action_from_ppo)
                 moved_successfully = self._move_agent(executed_action)
             if not moved_successfully:
-                reward -= 0.25
+                reward -= 0.5  # 벽 충돌 패널티 강화 (0.25 -> 0.5)
 
             # 미래충돌 패널티 (강화)
             ry, rx = self.agent_rc
@@ -1468,6 +1600,15 @@ class DynAvoidOneObjEnv(gym.Env):
                     if dist_to_obj_cells < 1.5:
                         extra_close_pen = (1.5 - dist_to_obj_cells) * 0.6  # 최대 약 0.9 감점
                         reward -= extra_close_pen
+                
+            # ESCAPE 모드 추가 보상: 위험 구역(danger_here)이 낮을수록 보상
+            if mode == "ESCAPE":
+                dh = float(self._last_danger_feats[0]) if self._last_danger_feats is not None else 0.0
+                # 위험도가 높으면 추가 패널티 (빨리 나가라고 재촉)
+                reward -= 0.1 * dh
+                # 위험도가 낮아지면(탈출 중이면) 매우 큰 보상 (탈출 최우선)
+                if dh < 0.1:
+                    reward += 1.0
 
             # 목표 진행도 보상(AVOID 중에도 전진 유도)
             gx, gy = self.waypoints[self.wp_idx] if self.wp_idx < len(self.waypoints) else self.waypoints[-1]

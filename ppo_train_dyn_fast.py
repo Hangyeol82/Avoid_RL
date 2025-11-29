@@ -13,7 +13,7 @@ from rl.ppo import PPOConfig, PPOTrainer
 # =============================================================================
 #  전이학습 설정: 불러올 모델 경로 (없으면 None)
 # =============================================================================
-PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/main_200iter_colab.pt"
+PRETRAINED_MODEL_PATH: Optional[str] = None
 # =============================================================================
 
 
@@ -25,7 +25,7 @@ def curriculum(iter_num: int, total_iters: int) -> Tuple[int, Dict[str, float], 
       - easy_mix: 과거 쉬운 분포(cv-only)로 강제 샘플링할 확률
     기본 설계(20k 가정)를 비율로 환산해 total_iters에 맞게 스케일함.
       0~3k (15%) : 1개, cv90%
-      3k~6k      : 1개, cv60% patrol35%
+      3k~6k      : 1개, cv50% patrol50%
       6k~9k      : 1개, ou50%
       9k~12k     : 1개, cv+patrol+ou 균등 + easy_mix 0.2
       12k~20k    : 2개 위주(80%는 K=2), 전 타입 균등 + easy_mix 0.15
@@ -51,7 +51,7 @@ def curriculum(iter_num: int, total_iters: int) -> Tuple[int, Dict[str, float], 
         easy_mix = 0.0
     elif iter_num <= t2:
         # 순찰(사인/원형) 도입
-        type_probs = {"cv": 0.60, "patrol": 0.35, "ou": 0.05}
+        type_probs = {"cv": 0.50, "patrol": 0.50, "ou": 0.00}
         obj_k = 1
         easy_mix = 0.0
     elif iter_num <= t3:
@@ -306,7 +306,7 @@ def main():
         obs_dim=obs_dim,
         act_dim=act_dim,
         rollout_steps=4096,
-        lr=2e-4,
+        lr=3e-4,
         epochs=10,
         batch_size=512,
         clip_eps=0.2,
@@ -317,8 +317,8 @@ def main():
         gae_lambda=0.95,
         device="cpu",
         seed=0,
-        hidden_sizes=(512,512,256),
-        feat_dim=384
+        hidden_sizes=(640, 640, 320),
+        feat_dim=512
     )
 
     trainer = PPOTrainer(env, cfg)
