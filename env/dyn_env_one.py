@@ -71,7 +71,7 @@ class DynAvoidOneObjEnv(gym.Env):
 
         # ----- 동적 객체 관측 슬롯 -----
         self.max_objs = int(max(1, max_objs))
-        self.obj_feat_len = 5  # [dist_norm, cos, sin, speed_norm, ttc_norm]
+        self.obj_feat_len = 7  # [dist_norm, cos, sin, speed_norm, ttc_norm, move_cos, move_sin]
         self.danger_feat_len = 2  # [current danger, nearby max]
         self.danger_lidar_bins = 16
 
@@ -447,25 +447,33 @@ class DynAvoidOneObjEnv(gym.Env):
                     ttc = max(0.0, -float(np.dot(rel_p_m, rel_v_mps)) / denom)
                 else:
                     ttc = self.T_cap_s
+                
+                # 이동 방향 벡터 (추가)
+                move_angle = np.arctan2(ovy, ovx)
+                move_cos = float(np.cos(move_angle))
+                move_sin = float(np.sin(move_angle))
+
                 ttc_capped = float(min(ttc, self.T_cap_s))
                 ttc_norm = ttc_capped / self.T_cap_s
-                objs_metrics.append((ttc_capped >= self.T_cap_s - 1e-9, ttc_capped, dist_cells, angle, speed_norm, d_norm, ttc_norm))
+                objs_metrics.append((ttc_capped >= self.T_cap_s - 1e-9, ttc_capped, dist_cells, angle, speed_norm, d_norm, ttc_norm, move_cos, move_sin))
 
             # 위협도 정렬: TTC 미캡 우선 → TTC → 거리
             objs_metrics.sort(key=lambda t: (t[0], t[1], t[2]))
             for j in range(min(self.max_objs, len(objs_metrics))):
-                _, _, _, angle, speed_norm, d_norm, ttc_norm = objs_metrics[j]
+                _, _, _, angle, speed_norm, d_norm, ttc_norm, move_cos, move_sin = objs_metrics[j]
                 per_obj_feats.extend([
                     d_norm,
                     float(np.cos(angle)),
                     float(np.sin(angle)),
                     speed_norm,
                     ttc_norm,
+                    move_cos,
+                    move_sin
                 ])
 
         # 패딩
         while len(per_obj_feats) < self.obj_feat_len * self.max_objs:
-            per_obj_feats.extend([1.0, 0.0, 0.0, 0.0, 1.0])
+            per_obj_feats.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
 
         # 라이다(정적)
         origin = (ry, rx)
@@ -1602,12 +1610,12 @@ class DynAvoidOneObjEnv(gym.Env):
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
             inside_soft = self._agent_inside_soft_danger()
             if not inside_soft:
-                reward += 0.5
+                reward += 2.0
             else:
-                reward -= 0.05
+                reward -= 0.1
 
         # 보상 클리핑 폭 확대
-        reward = float(np.clip(reward, -2.5, 2.5))
+        reward = float(np.clip(reward, -5.0, 5.0))
         self.steps += 1
         return self._obs(), reward, done, False, info
 

@@ -10,10 +10,10 @@ from env.env import make_map_30
 from rl.ppo import PPOConfig, PPOTrainer
 
 """
-python ppo_train_integrated.py \
+python3 ppo_train_integrated.py \
   --random-map --map-size 30 --regen-map-interval 10 \
-  --escape-updates 500 --main-every 1 --main-updates-per-escape 1 \
-  --rollout-steps 4096 --batch-size 512 --lr 2e-4 --device cpu
+  --escape-updates 300 --main-every 1 --main-updates-per-escape 1 \
+  --device cpu
 """
 # ------------------------------ 커리큘럼 ------------------------------ #
 def curriculum(iter_num: int, total_iters: int) -> Tuple[int, Dict[str, float], float]:
@@ -157,19 +157,19 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)
     # PPO 공통
-    p.add_argument("--rollout-steps", type=int, default=4096)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--rollout-steps", type=int, default=2048)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--main-hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
-    p.add_argument("--escape-hidden-sizes", type=int, nargs="+", default=[512, 512, 256])
-    p.add_argument("--main-feat-dim", type=int, default=384)
-    p.add_argument("--escape-feat-dim", type=int, default=384)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--main-hidden-sizes", type=int, nargs="+", default=[256, 256, 128])
+    p.add_argument("--escape-hidden-sizes", type=int, nargs="+", default=[256, 256, 128])
+    p.add_argument("--main-feat-dim", type=int, default=256)
+    p.add_argument("--escape-feat-dim", type=int, default=256)
     # 경로/저장
     p.add_argument("--out-dir", default="checkpoints_integrated")
-    p.add_argument("--save-interval", type=int, default=100)
-    p.add_argument("--pretrained-main", default="checkpoints_dyn/ppo_dyn_iter300.pt")
-    p.add_argument("--pretrained-escape", default="checkpoints_integrated/escape_iter500.pt")
+    p.add_argument("--save-interval", type=int, default=50)
+    p.add_argument("--pretrained-main", default="checkpoints_integrated/main_iter200.pt")
+    p.add_argument("--pretrained-escape", default="checkpoints_integrated/escape_iter200.pt")
     # 콜랩 드라이브 연동
     p.add_argument("--mount-drive", action="store_true", help="Colab에서 Google Drive 마운트 시도")
     p.add_argument("--drive-out-dir", default=None, help="지정 시 out-dir 대신 이 경로에 저장 (예: /content/drive/MyDrive/grid_ckpt)")
