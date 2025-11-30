@@ -14,7 +14,7 @@ MAIN_FEAT   = 256
 ESC_HIDDEN  = (256, 256, 128)
 ESC_FEAT    = 256
 
-
+"python3 ppo_test_vis.py --no-info-box"
 def load_model(model, path, device="cpu"):
     if os.path.exists(path):
         print(f"[INFO] Loading trained PPO weights from {path}")
@@ -46,7 +46,7 @@ def summarize_block(info):
     return line1 + "\n" + line2 + "\n" + line3
 
 
-def visualize_episode(env, model, escape_model=None, device="cpu", render_interval=0.05, max_steps=1000, seed=42):
+def visualize_episode(env, model, escape_model=None, device="cpu", render_interval=0.05, max_steps=1000, seed=42, show_info_box=True, info_toggle_key="i"):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     obs, _ = env.reset()
     done = False; trunc = False; step = 0
@@ -54,6 +54,16 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
     grid = env.grid.copy(); H, W = grid.shape
     plt.ion(); fig, ax = plt.subplots(figsize=(6,6))
     action_map = {0: "UP", 1: "LEFT", 2: "DOWN", 3: "RIGHT", 4: "STAY"}
+    info_state = {"visible": show_info_box}
+
+    def on_key(event):
+        key = (event.key or "").lower()
+        if key == info_toggle_key.lower():
+            info_state["visible"] = not info_state["visible"]
+            print(f"[INFO] Info box {'ON' if info_state['visible'] else 'OFF'} (toggle key: '{info_toggle_key}')")
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    print(f"[INFO] Press '{info_toggle_key}' to toggle the yellow info box (start visible={show_info_box})")
 
     while not (done or trunc) and step < max_steps:
         step += 1
@@ -107,22 +117,23 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
             title_str += " | STUCK"
         ax.set_title(title_str, loc="left", fontsize=10)
 
-        crit_text = summarize_block(info)
-        # danger 관측 디버그
-        dh = info.get("danger_here", 0.0)
-        dn = info.get("danger_near", 0.0)
-        dl = info.get("danger_lidar_max", 0.0)
-        crit_text += f"\nDanger here/near/lidar_max: {dh:.2f}/{dn:.2f}/{dl:.2f}"
-        last_replan = info.get("last_replan_reason", None)
-        if last_replan:
-            crit_text += f"\nReplan: {last_replan}"
-        ax.text(
-            0.01, 0.01, crit_text,
-            transform=ax.transAxes,
-            fontsize=9,
-            verticalalignment="bottom",
-            bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.5)
-        )
+        if info_state["visible"]:
+            crit_text = summarize_block(info)
+            # danger 관측 디버그
+            dh = info.get("danger_here", 0.0)
+            dn = info.get("danger_near", 0.0)
+            dl = info.get("danger_lidar_max", 0.0)
+            crit_text += f"\nDanger here/near/lidar_max: {dh:.2f}/{dn:.2f}/{dl:.2f}"
+            last_replan = info.get("last_replan_reason", None)
+            if last_replan:
+                crit_text += f"\nReplan: {last_replan}"
+            ax.text(
+                0.01, 0.01, crit_text,
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="bottom",
+                bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.5)
+            )
 
         ax.set_xlim(0, W); ax.set_ylim(H, 0)
         ax.legend(loc="upper right")
@@ -141,6 +152,9 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=1500)
+    parser.add_argument("--info-box", dest="show_info_box", action="store_true", default=True, help="Show yellow info box overlay")
+    parser.add_argument("--no-info-box", dest="show_info_box", action="store_false", help="Hide yellow info box overlay")
+    parser.add_argument("--info-toggle-key", default="i", help="Key to toggle info box visibility during run")
     args = parser.parse_args()
 
     seed = args.seed
@@ -164,7 +178,17 @@ def main():
         escape_model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=ESC_HIDDEN, feat_dim=ESC_FEAT).to(device)
         load_model(escape_model, args.escape_ckpt, device)
 
-    visualize_episode(env, model, escape_model=escape_model, device=device, render_interval=args.render_interval, max_steps=args.max_steps, seed=seed)
+    visualize_episode(
+        env,
+        model,
+        escape_model=escape_model,
+        device=device,
+        render_interval=args.render_interval,
+        max_steps=args.max_steps,
+        seed=seed,
+        show_info_box=args.show_info_box,
+        info_toggle_key=args.info_toggle_key,
+    )
 
 
 if __name__ == "__main__":
