@@ -18,7 +18,7 @@ from rl.ppo import PPOConfig, PPOTrainer
 python3 ppo_train_integrated_random.py \
   --random-map --map-size 30 --regen-map-interval 10 \
   --escape-updates 500 --main-every 1 --main-updates-per-escape 1 \
-  --rollout-steps 4096 --batch-size 512 --lr 2e-4 --device cpu
+  --rollout-steps 2048 --batch-size 256 --lr 2e-4 --device cpu
 """
 
 # ------------------------------ 커리큘럼 ------------------------------ #
@@ -132,8 +132,8 @@ def parse_args():
     # 경로/저장
     p.add_argument("--out-dir", default="checkpoints_integrated_random")
     p.add_argument("--save-interval", type=int, default=50)
-    p.add_argument("--pretrained-main", default=None)
-    p.add_argument("--pretrained-escape", default=None)
+    p.add_argument("--pretrained-main", default="checkpoints_integrated/main_iter300.pt")
+    p.add_argument("--pretrained-escape", default="checkpoints_integrated/escape_iter300.pt")
     # 콜랩 드라이브 연동
     p.add_argument("--mount-drive", action="store_true", help="Colab에서 Google Drive 마운트 시도")
     p.add_argument("--drive-out-dir", default=None, help="지정 시 out-dir 대신 이 경로에 저장 (예: /content/drive/MyDrive/grid_ckpt)")
