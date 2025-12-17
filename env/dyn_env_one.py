@@ -1453,11 +1453,11 @@ class DynAvoidOneObjEnv(gym.Env):
                     future_pen += (7.5 - fdist_cells) * self.future_pen_coef
             reward -= future_pen
 
-            # 객체와의 거리 변화(칸 기준)
-            prev_cells = (self.prev_obj_dist_m / self.cell_size_m) if (self.prev_obj_dist_m is not None and np.isfinite(self.prev_obj_dist_m)) else dist_to_obj_cells
-            delta_cells = dist_to_obj_cells - prev_cells if np.isfinite(dist_to_obj_cells) else 0.0
+            # 객체와의 거리 변화(칸 기준) - 사용자 요청으로 제거 (가만히 있어도 보상받는 문제 방지)
+            # prev_cells = (self.prev_obj_dist_m / self.cell_size_m) if (self.prev_obj_dist_m is not None and np.isfinite(self.prev_obj_dist_m)) else dist_to_obj_cells
+            # delta_cells = dist_to_obj_cells - prev_cells if np.isfinite(dist_to_obj_cells) else 0.0
             self.prev_obj_dist_m = dist_to_obj_m
-            reward += self.delta_dist_coef * float(np.clip(delta_cells, -1.0, 1.0))
+            # reward += self.delta_dist_coef * float(np.clip(delta_cells, -1.0, 1.0))
 
             # 충돌/위험/안전
             if np.isfinite(dist_to_obj_cells) and dist_to_obj_cells <= COLLISION:
