@@ -1438,7 +1438,7 @@ class DynAvoidOneObjEnv(gym.Env):
                 executed_action = int(action_from_ppo)
                 moved_successfully = self._move_agent(executed_action)
             if not moved_successfully:
-                reward -= 0.25
+                reward -= 1.0 # 벽 충돌 패널티 강화 (0.25 -> 1.0)
 
             # 미래충돌 패널티 (강화)
             ry, rx = self.agent_rc

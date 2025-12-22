@@ -74,13 +74,10 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
             logits, _ = active_model(obs_t)
             action = torch.argmax(logits, dim=-1).item()
         obs, reward, done, trunc, info = env.step(action)
-        # 터미널 디버그 출력(10스텝마다)
-        if step % 10 == 0:
-            print(
-                f"step {step} mode={info.get('mode')} esc={info.get('escape_active')} "
-                f"danger h/n/l={info.get('danger_here',0):.2f}/{info.get('danger_near',0):.2f}/{info.get('danger_lidar_max',0):.2f} "
-                f"rays min/mean/max={info.get('ray_min',0):.2f}/{info.get('ray_mean',0):.2f}/{info.get('ray_max',0):.2f}"
-            )
+        # 터미널 디버그 출력(매 스텝)
+        if step % 1 == 0:
+            action_str = action_map.get(action, str(action))
+            print(f"step {step} | act={action_str}")
 
         ax.clear()
         ax.imshow(grid, cmap="Greys", origin="upper")
@@ -148,7 +145,7 @@ def main():
     parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter150.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=86746)
+    parser.add_argument("--seed", type=int, default=86)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=1500)
