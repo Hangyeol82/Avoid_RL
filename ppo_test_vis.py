@@ -145,7 +145,7 @@ def main():
     parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter300.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=8533)
+    parser.add_argument("--seed", type=int, default=13342)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=1500)
@@ -162,9 +162,18 @@ def main():
     grid = np.load(args.grid_path); wps = np.load(args.waypoints_path)
 
     use_escape = args.escape_ckpt is not None
-    env = DynAvoidOneObjEnv(grid=grid, waypoints=wps, seed=seed, cell_size_m=0.20, use_escape_subpolicy=use_escape)
+    # [CNN] local_map_size 추가
+    env = DynAvoidOneObjEnv(
+        grid=grid, 
+        waypoints=wps, 
+        seed=seed, 
+        cell_size_m=0.20, 
+        use_escape_subpolicy=use_escape,
+        local_map_size=15
+    )
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
+    print(f"[INFO] Environment initialized. Obs dim: {obs_dim} (Map included: {obs_dim > 300})")
 
     device = args.device
     model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=MAIN_HIDDEN, feat_dim=MAIN_FEAT).to(device)

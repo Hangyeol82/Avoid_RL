@@ -1320,7 +1320,7 @@ class DynAvoidOneObjEnv(gym.Env):
 
     # (데모용) 기본 스폰
     @staticmethod
-    def _default_spawn(occ_grid, waypoints, rng, v_robot=1.0, v_obj_range=(0.6,1.2), k_min=1, k_max=2, max_retry=50):
+    def _default_spawn(occ_grid, waypoints, rng, v_robot=1.0, v_obj_range=(0.3,1.1), k_min=1, k_max=2, max_retry=50):
         H, W = occ_grid.shape
         objs = []
         t_robot = estimate_robot_timeline(waypoints, v_robot_cells_per_step=v_robot)
