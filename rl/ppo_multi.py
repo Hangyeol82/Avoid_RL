@@ -37,11 +37,16 @@ class PPOTrainerMulti:
         # Distribute total rollout steps across environments
         self.steps_per_env = cfg.rollout_steps // self.num_envs
         
+        # [Fix] Allocate full rollout_steps capacity to each buffer.
+        # This allows "fast" environments (where escape triggers often) to collect more data
+        # and compensate for "slow" environments, preventing the collector from waiting.
+        self.buffer_capacity = cfg.rollout_steps
+
         self.buffers = [
             RolloutBuffer(
                 BufferConfig(
                     obs_dim=cfg.obs_dim,
-                    max_size=self.steps_per_env, # Each buffer holds a fraction
+                    max_size=self.buffer_capacity, 
                     gamma=cfg.gamma,
                     gae_lambda=cfg.gae_lambda,
                     device=cfg.device,

@@ -13,19 +13,12 @@ from rl.ppo_multi import PPOTrainerMulti
 from rl.vec_env import SubprocVecEnv
 
 """
-python3 ppo_train_multi.py \
-  --pretrained-main "checkpoints_integrated_random/main_iter50.pt" \
-  --pretrained-escape "checkpoints_integrated_random/escape_iter50.pt" \
-  --random-map --map-size 30 --regen-map-interval 10 \
-  --escape-updates 300 --main-every 1 --main-updates-per-escape 1 \
-  --rollout-steps 4096 --batch-size 256 --lr 2e-4 --device cpu
-"""
-
-"""
-python3 ppo_train_multi.py \
-  --random-map --map-size 30 --regen-map-interval 10 \
-  --escape-updates 300 --main-every 1 --main-updates-per-escape 1 \
-  --rollout-steps 4096 --batch-size 256 --lr 2e-4 --device cpu
+# Windows PowerShell Execution Command (CUDA, 6 Envs)
+python ppo_train_multi.py `
+  --random-map --map-size 30 --regen-map-interval 10 `
+  --escape-updates 300 --main-every 1 --main-updates-per-escape 1 `
+  --rollout-steps 4096 --batch-size 256 --lr 2e-4 --device cuda `
+  --num-envs 6
 """
 
 # Re-use curriculum logic
@@ -113,10 +106,13 @@ def collect_escape_segments_multi(trainer: PPOTrainerMulti, cfg, pre_steps=12, e
     
     curr_obs = trainer._curr_obs # (N, obs_dim)
 
-    while total_collected < cfg.rollout_steps and steps_run < max_steps_run:
+    # Calculate effective target based on buffer capacity
+    target_steps = trainer.steps_per_env * num_envs
+
+    while total_collected < target_steps and steps_run < max_steps_run:
         steps_run += 1
         if steps_run % 500 == 0:
-            print(f"[DEBUG] Collecting escape segments: steps_run={steps_run}, collected={total_collected}/{cfg.rollout_steps}")
+            print(f"[DEBUG] Collecting escape segments: steps_run={steps_run}, collected={total_collected}/{target_steps}")
         
         # 1. Inference
         with torch.no_grad():
