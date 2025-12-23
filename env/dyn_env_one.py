@@ -38,6 +38,7 @@ class DynAvoidOneObjEnv(gym.Env):
         consider_occlusion_in_obs: bool = True,
         consider_occlusion_in_mode: bool = True,
         use_escape_subpolicy: bool = False,
+        local_map_size: int = 15,  # [CNN] Local map size (odd number recommended)
     ):
         super().__init__()
         assert grid.ndim == 2
@@ -75,13 +76,19 @@ class DynAvoidOneObjEnv(gym.Env):
         self.danger_feat_len = 2  # [current danger, nearby max]
         self.danger_lidar_bins = 16
 
+        # [CNN] Local Map Config
+        self.local_map_size = local_map_size
+        self.local_map_dim = self.local_map_size * self.local_map_size
+
         # ----- 액션/관측 공간 -----
         self.action_space = spaces.Discrete(5)  # 0=상,1=좌,2=하,3=우,4=정지
-        self.obs_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len + self.danger_lidar_bins
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
-
-        # 이동 벡터(상,좌,하,우)
         self.moves = [(-1,0), (0,-1), (1,0), (0,1)]
+
+        # obs_dim = MLP_features + Local_Map_features
+        self.mlp_dim = 3 + (self.obj_feat_len * self.max_objs) + self.ray_count + self.danger_feat_len + self.danger_lidar_bins
+        self.obs_dim = self.mlp_dim + self.local_map_dim
+        
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
 
         # ----- 상태 변수 -----
         self.wp_idx: int = 0
@@ -512,9 +519,35 @@ class DynAvoidOneObjEnv(gym.Env):
             self._last_ttc = 1.0
         self.visible_obj_ids = visible_ids
 
-        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats, danger_lidar], axis=0)
+        # [CNN] Local Map Extraction
+        local_map = self._get_local_map(self.local_map_size)
+        local_map_flat = local_map.flatten()
+
+        obs = np.concatenate([goal_feats, np.array(per_obj_feats, dtype=np.float32), rays, danger_feats, danger_lidar, local_map_flat], axis=0)
         assert obs.shape[0] == self.obs_dim
         return obs
+
+    def _get_local_map(self, size=15):
+        """
+        Extract local static map around the agent.
+        Returns: (size, size) numpy array with 0.0 (free) or 1.0 (occupied/out-of-bounds)
+        """
+        H, W = self.grid.shape
+        r, c = int(round(self.agent_rc[0])), int(round(self.agent_rc[1]))
+        half = size // 2
+        
+        # Pad grid with 1 (walls) for out-of-bounds handling
+        padded_grid = np.ones((H + 2 * half, W + 2 * half), dtype=np.float32)
+        padded_grid[half:half+H, half:half+W] = self.grid
+        
+        # Crop
+        # Agent is at (r, c) in original grid -> (r+half, c+half) in padded grid
+        # We want [r+half-half : r+half+half+1] -> [r : r+size]
+        r_start = r
+        c_start = c
+        local_map = padded_grid[r_start : r_start + size, c_start : c_start + size]
+        
+        return local_map
 
     # ----------------------- 경로 방해 유틸 -----------------------
     @staticmethod
