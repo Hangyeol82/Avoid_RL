@@ -277,8 +277,8 @@ def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default="checkpoints_integrated/main_iter300.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_integrated/escape_iter300.pt")
+    parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter300.pt")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter300.pt")
     parser.add_argument("--episodes", type=int, default=50, help="Episodes per scenario")
     parser.add_argument("--max-steps", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=2024)
