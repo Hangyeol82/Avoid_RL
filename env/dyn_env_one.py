@@ -1501,14 +1501,18 @@ class DynAvoidOneObjEnv(gym.Env):
                 self.avoiding = False
             else:
                 reward += self.avoid_base_pen  # 기본 AVOID 페널티(완화)
-                if np.isfinite(dist_to_obj_cells):
-                    closeness_norm = (DANGER - dist_to_obj_cells) / max(DANGER, 1e-6)
-                    if closeness_norm > 0:
-                        reward -= self.prox_pen_scale * (closeness_norm ** self.prox_pen_pow)
-                    # 매우 근접(충돌 직전) 시 추가 강한 패널티
-                    if dist_to_obj_cells < 1.5:
-                        extra_close_pen = (1.5 - dist_to_obj_cells) * 0.6  # 최대 약 0.9 감점
-                        reward -= extra_close_pen
+                if np.isfinite(dist_to_obj_cells) and dist_to_obj_cells < DANGER:
+                    # [Sigmoid Penalty] - 조정됨 (User Request)
+                    # 5.0 ~ 4.0칸: 0.07 ~ 0.41 (경고)
+                    # 4.0 ~ 2.0칸: 0.41 ~ 1.70 (가파른 상승, 그러나 과하지 않게)
+                    # < 2.0칸    : 1.70 ~ 1.80 (최대치 포화)
+                    sig_max = 1.8    # 패널티 상한선 (2.5 -> 1.8)
+                    sig_mid = 3.4    # 변곡점 (3.2 -> 3.4)
+                    sig_k   = 2.0    # 기울기 유지
+
+                    # P(d) = Max / (1 + exp(k * (d - mid)))
+                    sigmoid_pen = sig_max / (1.0 + np.exp(sig_k * (dist_to_obj_cells - sig_mid)))
+                    reward -= sigmoid_pen
 
             # 목표 진행도 보상(AVOID 중에도 전진 유도)
             gx, gy = self.waypoints[self.wp_idx] if self.wp_idx < len(self.waypoints) else self.waypoints[-1]
