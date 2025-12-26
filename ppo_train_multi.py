@@ -48,8 +48,8 @@ def parse_args():
     # Path/Save
     p.add_argument("--out-dir", default="checkpoints_integrated_random")
     p.add_argument("--save-interval", type=int, default=50)
-    p.add_argument("--pretrained-main", default="checkpoints_integrated/main_iter300.pt")
-    p.add_argument("--pretrained-escape", default="checkpoints_integrated/escape_iter300.pt")
+    p.add_argument("--pretrained-main", default="checkpoints_integrated_random/main_iter300.pt")
+    p.add_argument("--pretrained-escape", default="checkpoints_integrated_random/escape_iter300.pt")
     # Drive
     p.add_argument("--mount-drive", action="store_true")
     p.add_argument("--drive-out-dir", default=None)
