@@ -1616,21 +1616,68 @@ class DynAvoidOneObjEnv(gym.Env):
             self.goal_stagnation_timer = 0
             self.visited[self.wp_idx] = True
             reward += 0.4
-            if self.wp_idx >= len(self.waypoints) - 1:
+            
+            # [Effective Coverage Check]
+            # 남은 웨이포인트가 모두 위험 지역(Soft Danger)에 있다면 종료(성공) 처리
+            unvisited_indices = np.where(~self.visited)[0]
+            if len(unvisited_indices) == 0:
                 done = True
                 reward += 2.0
             else:
+                if self.danger_zone_map is not None and getattr(self.danger_zone_map, "soft", None) is not None:
+                    soft = self.danger_zone_map.soft
+                    blocked_count = 0
+                    for idx in unvisited_indices:
+                        wy, wx = self.waypoints[idx]
+                        # 위험 임계치 이상이면 접근 불가로 간주
+                        if soft[wy, wx] >= self.danger_soft_block:
+                            blocked_count += 1
+                    
+                    if blocked_count == len(unvisited_indices):
+                        # 남은 모든 곳이 위험 지역임 -> 사실상 완료
+                        done = True
+                        reward += 2.0
+                        info["finish_reason"] = "effective_coverage_complete"
+
+            if not done:
+                # 다음 웨이포인트가 위험하다면, 안전한 곳을 찾아 건너뛰기(Re-indexing) 시도
+                # (단, 너무 자주 바꾸면 진동하므로 간단히 다음 인덱스로만 이동하거나, 
+                #  아래 else 블록의 replan 로직에 맡김)
                 self.wp_idx += 1
+                if self.wp_idx < len(self.waypoints):
+                    # 만약 방금 바뀐 타겟도 위험하다면? -> 아래 else 블록에서 즉시 리플랜 유도
+                    pass
+
         else:
             self.goal_stagnation_timer += 1
-            if self.goal_stagnation_timer >= self.goal_timeout_steps:
+            
+            # [Proactive Replanning]
+            # 현재 목표가 위험 지역에 잠겼다면, 타임아웃 기다리지 말고 즉시 경로 재설정 시도
+            current_target_blocked = False
+            if self.wp_idx < len(self.waypoints) and self.danger_zone_map is not None:
+                wy, wx = self.waypoints[self.wp_idx]
+                if getattr(self.danger_zone_map, "soft", None) is not None:
+                    if self.danger_zone_map.soft[wy, wx] >= self.danger_soft_block:
+                        current_target_blocked = True
+
+            # 정체되었거나, 현재 목표가 막혔을 때 리플랜
+            if self.goal_stagnation_timer >= self.goal_timeout_steps or (current_target_blocked and self.goal_stagnation_timer % 10 == 0):
                 self.goal_stagnation_timer = 0
-                mask = (self.grid == 1) | self.covered_mask
-                if self.danger_zone_map is not None:
-                    mask |= self.danger_zone_map.hard
-                new_path = self._plan_path_with_mask(mask, self.waypoints[-1])
-                if new_path:
-                    self._apply_cpp_path(new_path)
+                
+                # 현재 위치에서 다시 CPP 경로 생성 (위험지역 회피 포함)
+                # _build_cpp_path 내부에서 danger_zone_map을 고려하여 경로를 짬
+                new_cpp = self._build_cpp_path(start_rc=self.agent_rc.copy())
+                if new_cpp:
+                    self._last_replan_reason = "target_blocked" if current_target_blocked else "stagnation"
+                    self._apply_cpp_path(new_cpp)
+                else:
+                    # CPP 실패 시(갈 곳이 없음), 단순 마스킹 경로 계획 시도
+                    mask = (self.grid == 1) | self.covered_mask
+                    if self.danger_zone_map is not None:
+                        mask |= self.danger_zone_map.hard
+                    new_path = self._plan_path_with_mask(mask, self.waypoints[-1])
+                    if new_path:
+                        self._apply_cpp_path(new_path)
 
         # Danger zone 침범 패널티 (ESCAPE 모드일 땐 종료시키지 않음)
         skip_danger_penalty = self.use_escape_subpolicy and getattr(self, "escape_active", False)
