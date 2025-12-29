@@ -1628,9 +1628,9 @@ class DynAvoidOneObjEnv(gym.Env):
                     soft = self.danger_zone_map.soft
                     blocked_count = 0
                     for idx in unvisited_indices:
-                        wy, wx = self.waypoints[idx]
+                        wx, wy = self.waypoints[idx]
                         # 위험 임계치 이상이면 접근 불가로 간주
-                        if soft[wy, wx] >= self.danger_soft_block:
+                        if soft[int(wy), int(wx)] >= self.danger_soft_block:
                             blocked_count += 1
                     
                     if blocked_count == len(unvisited_indices):
@@ -1655,9 +1655,9 @@ class DynAvoidOneObjEnv(gym.Env):
             # 현재 목표가 위험 지역에 잠겼다면, 타임아웃 기다리지 말고 즉시 경로 재설정 시도
             current_target_blocked = False
             if self.wp_idx < len(self.waypoints) and self.danger_zone_map is not None:
-                wy, wx = self.waypoints[self.wp_idx]
+                wx, wy = self.waypoints[self.wp_idx]
                 if getattr(self.danger_zone_map, "soft", None) is not None:
-                    if self.danger_zone_map.soft[wy, wx] >= self.danger_soft_block:
+                    if self.danger_zone_map.soft[int(wy), int(wx)] >= self.danger_soft_block:
                         current_target_blocked = True
 
             # 정체되었거나, 현재 목표가 막혔을 때 리플랜
