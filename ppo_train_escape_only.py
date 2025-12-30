@@ -39,6 +39,7 @@ def parse_args():
     
     # 병렬 처리
     p.add_argument("--num-envs", type=int, default=4, help="병렬 환경 개수")
+    p.add_argument("--regen-map-interval", type=int, default=10, help="맵 재생성 주기 (0이면 안 함)")
     
     return p.parse_args()
 
@@ -111,7 +112,28 @@ def main():
         print(f"[INFO] Loaded pretrained model: {args.pretrained}")
         
     # 4. 학습 루프
+    map_seed = args.seed
     for it in range(1, args.total_iters + 1):
+        # 맵 재생성 로직
+        if args.regen_map_interval > 0 and it % args.regen_map_interval == 0:
+            map_seed += 1
+            print(f"[INFO] Regenerating map... (seed={map_seed})")
+            
+            # 기존 환경 종료
+            vec_env.close()
+            
+            # 새 맵 생성
+            grid, wps = build_map(args, map_seed)
+            
+            # 새 환경 생성
+            env_fns = [make_env_fn(grid, wps, seed=map_seed + i) for i in range(args.num_envs)]
+            vec_env = SubprocVecEnv(env_fns)
+            
+            # 트레이너에 새 환경 연결 및 관측 초기화
+            trainer.env = vec_env
+            obs = vec_env.reset()
+            trainer._curr_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            
         # 데이터 수집 (모든 에피소드가 탈출 시나리오)
         steps = trainer.collect_rollout()
         
