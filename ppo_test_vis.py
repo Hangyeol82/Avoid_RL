@@ -142,10 +142,10 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
 def main():
     parser = argparse.ArgumentParser(description="메인/ESC 정책 시각화")
     parser.add_argument("--ckpt", default="checkpoints_integrated_random/main_iter800.pt")
-    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter400.pt", help="ESC 서브 정책 checkpoint")
+    parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=2342)
+    parser.add_argument("--seed", type=int, default=242)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render-interval", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=1500)

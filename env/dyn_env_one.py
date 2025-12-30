@@ -1497,7 +1497,10 @@ class DynAvoidOneObjEnv(gym.Env):
                 reward -= 2.0
                 done = True
             elif np.isfinite(dist_to_obj_cells) and dist_to_obj_cells >= SAFE:
-                reward += 0.3
+                # [Reward Hacking 방지]
+                # 회피 성공 보상을 제거(0.0)하여, '위험 지역 진입 -> 탈출' 반복으로 보상을 얻는 행위를 차단함.
+                # 대신 AVOID 모드가 해제되면 자연스럽게 FOLLOW 모드의 보상(경로 진행 등)을 받게 됨.
+                reward += 0.0
                 self.avoiding = False
             else:
                 reward += self.avoid_base_pen  # 기본 AVOID 페널티(완화)
