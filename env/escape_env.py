@@ -131,12 +131,25 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
         # 부모 클래스의 step 실행 (보상 계산 등은 그대로 활용)
         obs, reward, done, trunc, info = super().step(action)
         
+        # [추가 패널티] 위험 구역 내부에 있을 때 지속적인 패널티 부여
+        # 부모 클래스에서는 '동적 객체와의 거리'만으로 패널티를 주지만,
+        # 여기서는 '인공 위험 구역(Trap)'에 갇힌 상황이므로, Trap 위에 있는 것 자체로 패널티를 줘야 함.
+        if self.danger_zone_map is not None and getattr(self.danger_zone_map, "soft", None) is not None:
+            soft = self.danger_zone_map.soft
+            ry, rx = int(self.agent_rc[0]), int(self.agent_rc[1])
+            if 0 <= ry < self.H and 0 <= rx < self.W:
+                danger_val = soft[ry, rx]
+                if danger_val > 0.1:
+                    # 위험도에 비례한 패널티 (최대 -0.5)
+                    # 가만히 있으면 계속 깎이므로 밖으로 나가야 함.
+                    reward -= 0.5 * danger_val
+
         # [종료 조건 추가]
         # 원래 환경에서는 escape가 끝나면 다시 FOLLOW 모드로 가지만,
         # 여기서는 '탈출 성공'이 곧 에피소드 클리어임.
         if not self.escape_active and not done:
             done = True
-            reward += 2.0  # 추가 성공 보상 (기존 1.3 + 2.0 = 3.3)
+            reward += 1.3  # 탈출 성공 보상 (충돌 패널티 -2.0보다 작게 설정하여 안전 우선)
             info["finish_reason"] = "escape_training_success"
             
         return obs, reward, done, trunc, info
