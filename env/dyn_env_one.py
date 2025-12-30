@@ -1601,17 +1601,16 @@ class DynAvoidOneObjEnv(gym.Env):
         elif not self.override_path:
             self.avoid_seen_obj_ids.clear()
 
-        # ESCAPE 모드 해제 조건: 위험 구역을 벗어나 일정 스텝 유지
+        # ESCAPE 모드 해제 조건: 위험 구역을 벗어나면 즉시 해제 (버퍼 스텝 제거)
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
             if not self._agent_inside_soft_danger():
-                self._escape_release_counter += 1
-                if self._escape_release_counter >= getattr(self, "escape_release_steps", 3):
-                    self.escape_active = False
-                    self._escape_release_counter = 0
-                    new_cpp = self._build_cpp_path(start_rc=self.agent_rc.copy())
-                    if new_cpp:
-                        self._last_replan_reason = "escape_complete"
-                        self._apply_cpp_path(new_cpp)
+                # 즉시 해제
+                self.escape_active = False
+                self._escape_release_counter = 0
+                new_cpp = self._build_cpp_path(start_rc=self.agent_rc.copy())
+                if new_cpp:
+                    self._last_replan_reason = "escape_complete"
+                    self._apply_cpp_path(new_cpp)
             else:
                 self._escape_release_counter = 0
 
