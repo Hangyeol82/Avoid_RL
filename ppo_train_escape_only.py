@@ -10,7 +10,7 @@ from rl.vec_env import SubprocVecEnv
 
 """
 [Escape Policy 집중 훈련 스크립트 (Multi-Env)]
-python3 ppo_train_escape_only.py --device cpu --rollout-steps 2048 --epochs 10 --num-envs 4
+python3 ppo_train_escape_only.py --device cuda --rollout-steps 2052 --epochs 10 --num-envs 4
 """
 
 def parse_args():

@@ -100,3 +100,24 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
             info["finish_reason"] = "escape_training_success"
             
         return obs, reward, done, trunc, info
+
+    def _stamp_danger_pts(self, pts):
+        """
+        [최적화] 부모 클래스의 _stamp_danger_pts는 점 하나당 5x5=25번의 _stamp_disc를 호출하여
+        매우 느림 (특히 점이 200개일 때). 이를 단순화하여 속도를 개선함.
+        """
+        if self.danger_zone_map is None or not pts:
+            return
+        
+        # 1. Polyline 연결 (기존 유지 - 선형 보간)
+        self.danger_zone_map.stamp_polyline(pts, radius_cells=1.2, val=0.9)
+        
+        # 2. 점 찍기 (단순화: 루프 제거)
+        # 기존에는 거리별로 3단계 Gradient를 주었으나, 여기서는 단일 원으로 처리
+        for y, x in pts:
+            self.danger_zone_map._stamp_disc(
+                self.danger_zone_map.soft,
+                y, x,
+                r_cells=1.8,  # 충분히 큰 반경
+                val=0.95      # 높은 위험도
+            )
