@@ -14,11 +14,7 @@ from rl.vec_env import SubprocVecEnv
 
 """
 # Windows PowerShell Execution Command (CUDA, 6 Envs)
-python ppo_train_multi.py `
-  --random-map --map-size 30 --regen-map-interval 10 `
-  --escape-updates 300 --main-every 1 --main-updates-per-escape 1 `
-  --rollout-steps 4096 --batch-size 256 --lr 2e-4 --device cuda `
-  --num-envs 6
+& "C:/Users/kingn/OneDrive/Desktop/Mower/Avoid_RL/.venv/Scripts/python.exe" ppo_train_multi.py --random-map --map-size 30 --regen-map-interval 10 --escape-updates 3000 --main-every 1 --main-updates-per-escape 1 --rollout-steps 4096 --batch-size 256 --lr 2e-4 --device cuda --num-envs 6
 """
 
 # Re-use curriculum logic

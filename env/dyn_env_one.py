@@ -1520,10 +1520,14 @@ class DynAvoidOneObjEnv(gym.Env):
             if self._prev_goal_dist_cells is None:
                 self._prev_goal_dist_cells = goal_dist_cells
             prog_delta = self._prev_goal_dist_cells - goal_dist_cells
-            clipped_delta = float(np.clip(prog_delta, -1.0, 1.0))
-            reward += self.progress_coef * clipped_delta
-            if prog_delta > 1e-6:
-                reward += self.progress_bonus * min(1.0, prog_delta)
+            
+            # [Escape Mode] 목표 진행도 보상 제외 (탈출에 집중)
+            if mode != "ESCAPE":
+                clipped_delta = float(np.clip(prog_delta, -1.0, 1.0))
+                reward += self.progress_coef * clipped_delta
+                if prog_delta > 1e-6:
+                    reward += self.progress_bonus * min(1.0, prog_delta)
+            
             self._prev_goal_dist_cells = goal_dist_cells
 
             # 거의 안 움직였으면 소폭 패널티
@@ -1615,7 +1619,10 @@ class DynAvoidOneObjEnv(gym.Env):
         if self._reached_waypoint():
             self.goal_stagnation_timer = 0
             self.visited[self.wp_idx] = True
-            reward += 0.4
+            
+            # [Escape Mode] 목표 도달 보상 제외
+            if mode != "ESCAPE":
+                reward += 0.4
             
             # [Effective Coverage Check]
             # 남은 웨이포인트가 모두 위험 지역(Soft Danger)에 있다면 종료(성공) 처리
@@ -1657,8 +1664,24 @@ class DynAvoidOneObjEnv(gym.Env):
             if self.wp_idx < len(self.waypoints) and self.danger_zone_map is not None:
                 wx, wy = self.waypoints[self.wp_idx]
                 if getattr(self.danger_zone_map, "soft", None) is not None:
-                    if self.danger_zone_map.soft[int(wy), int(wx)] >= self.danger_soft_block:
+                    if self.danger_zone_map.soft[int(wy), int(wx)] >= getattr(self, "danger_soft_block", 0.3):
                         current_target_blocked = True
+
+                        # [Effective Coverage Check - Proactive]
+                        # 현재 타겟이 막혔는데, 남은 타겟들도 모두 막혔다면 즉시 종료
+                        unvisited_indices = np.where(~self.visited)[0]
+                        soft = self.danger_zone_map.soft
+                        blocked_count = 0
+                        thr = getattr(self, "danger_soft_block", 0.3)
+                        for idx in unvisited_indices:
+                            wx2, wy2 = self.waypoints[idx]
+                            if soft[int(wy2), int(wx2)] >= thr:
+                                blocked_count += 1
+                        
+                        if blocked_count == len(unvisited_indices):
+                            done = True
+                            reward += 2.0
+                            info["finish_reason"] = "effective_coverage_complete"
 
             # 정체되었거나, 현재 목표가 막혔을 때 리플랜
             if self.goal_stagnation_timer >= self.goal_timeout_steps or (current_target_blocked and self.goal_stagnation_timer % 10 == 0):
@@ -1694,9 +1717,9 @@ class DynAvoidOneObjEnv(gym.Env):
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
             inside_soft = self._agent_inside_soft_danger()
             if not inside_soft:
-                reward += 2.0
+                reward += 1.3  # 탈출 성공 보상 조정 (3.0 -> 1.3)
             else:
-                reward -= 0.1
+                reward -= 0.15 # 체류 패널티 강화 (-0.1 -> -0.15)
 
         # 보상 클리핑 폭 확대
         reward = float(np.clip(reward, -5.0, 5.0))
