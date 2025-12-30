@@ -92,10 +92,11 @@ class PPOTrainerMulti:
                 # 3) Store in buffers
                 for i in range(self.num_envs):
                     current_mode = infos[i].get("mode", "FOLLOW_CPP")
-                    mask = (current_mode == "AVOID")
+                    # [Fix] ESCAPE 모드도 학습 데이터에 포함 (Escape 전용 훈련을 위해)
+                    mask = (current_mode == "AVOID" or current_mode == "ESCAPE")
                     
                     # Retroactive masking logic
-                    if current_mode == "AVOID" and self._last_modes[i] == "FOLLOW_CPP":
+                    if (current_mode == "AVOID" or current_mode == "ESCAPE") and self._last_modes[i] == "FOLLOW_CPP":
                         self.buffers[i].apply_mask_retroactively(self.mask_retroactive_steps)
                     
                     self.buffers[i].store(
