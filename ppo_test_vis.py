@@ -77,7 +77,8 @@ def visualize_episode(env, model, escape_model=None, device="cpu", render_interv
         # 터미널 디버그 출력(매 스텝)
         if step % 1 == 0:
             action_str = action_map.get(action, str(action))
-            print(f"step {step} | act={action_str}")
+            mode = info.get('mode', 'UNKNOWN')
+            print(f"step {step} | Mode={mode} | act={action_str} | R={reward:.3f}")
 
         ax.clear()
         ax.imshow(grid, cmap="Greys", origin="upper")
@@ -145,9 +146,9 @@ def main():
     parser.add_argument("--escape-ckpt", default="checkpoints_integrated_random/escape_iter500.pt", help="ESC 서브 정책 checkpoint")
     parser.add_argument("--grid-path", default="map_grid.npy")
     parser.add_argument("--waypoints-path", default="waypoints.npy")
-    parser.add_argument("--seed", type=int, default=3262)
+    parser.add_argument("--seed", type=int, default=242)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--render-interval", type=float, default=0.05)
+    parser.add_argument("--render-interval", type=float, default=0.001)
     parser.add_argument("--max-steps", type=int, default=1500)
     parser.add_argument("--info-box", dest="show_info_box", action="store_true", default=True, help="Show yellow info box overlay")
     parser.add_argument("--no-info-box", dest="show_info_box", action="store_false", help="Hide yellow info box overlay")

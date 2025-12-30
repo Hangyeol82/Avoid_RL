@@ -111,6 +111,7 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
         
         # (4) 에이전트를 위험 구역 내부(중심)로 이동
         self.agent_rc = np.array([float(cy), float(cx)], dtype=float)
+        self.trap_center = np.array([float(cy), float(cx)], dtype=float)
         
         # (5) 동적 객체 배치 (이미 위에서 계산된 안전한 위치 사용)
         target_obj.p = np.array([oy, ox], dtype=float)
@@ -129,21 +130,10 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
 
     def step(self, action):
         # 부모 클래스의 step 실행 (보상 계산 등은 그대로 활용)
+        # 부모 클래스(DynAvoidOneObjEnv)에 Danger Zone Penalty 로직이 추가되었으므로,
+        # 여기서는 별도의 패널티 로직을 제거하고 Reward Shaping과 종료 조건만 처리함.
         obs, reward, done, trunc, info = super().step(action)
         
-        # [추가 패널티] 위험 구역 내부에 있을 때 지속적인 패널티 부여
-        # 부모 클래스에서는 '동적 객체와의 거리'만으로 패널티를 주지만,
-        # 여기서는 '인공 위험 구역(Trap)'에 갇힌 상황이므로, Trap 위에 있는 것 자체로 패널티를 줘야 함.
-        if self.danger_zone_map is not None and getattr(self.danger_zone_map, "soft", None) is not None:
-            soft = self.danger_zone_map.soft
-            ry, rx = int(self.agent_rc[0]), int(self.agent_rc[1])
-            if 0 <= ry < self.H and 0 <= rx < self.W:
-                danger_val = soft[ry, rx]
-                if danger_val > 0.1:
-                    # 위험도에 비례한 패널티 (최대 -0.5)
-                    # 가만히 있으면 계속 깎이므로 밖으로 나가야 함.
-                    reward -= 0.5 * danger_val
-
         # [종료 조건 추가]
         # 원래 환경에서는 escape가 끝나면 다시 FOLLOW 모드로 가지만,
         # 여기서는 '탈출 성공'이 곧 에피소드 클리어임.

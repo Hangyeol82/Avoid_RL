@@ -1287,6 +1287,7 @@ class DynAvoidOneObjEnv(gym.Env):
         self.steps    = 0
         self.deviated_from_cpp = False
         self.prev_obj_dist_m   = None
+        self.prev_dist_from_center = None
         self.prev_agent_rc     = self.agent_rc.copy()
         self.avoiding          = False
         self.visited           = np.zeros(len(self.waypoints), dtype=bool)
@@ -1517,6 +1518,19 @@ class DynAvoidOneObjEnv(gym.Env):
                     sigmoid_pen = sig_max / (1.0 + np.exp(sig_k * (dist_to_obj_cells - sig_mid)))
                     reward -= sigmoid_pen
 
+            # [Danger Zone Penalty]
+            # 위험 구역(Danger Map) 위에 있으면 지속적인 패널티 부여
+            # Escape 모드뿐만 아니라 일반 Avoid 모드에서도 위험 지역을 피하도록 유도
+            if self.danger_zone_map is not None and getattr(self.danger_zone_map, "soft", None) is not None:
+                soft = self.danger_zone_map.soft
+                ry_i, rx_i = int(ry), int(rx)
+                if 0 <= ry_i < self.H and 0 <= rx_i < self.W:
+                    danger_val = soft[ry_i, rx_i]
+                    if danger_val > 0.1:
+                        # [Fixed Penalty] 위험 구역 진입 시 고정 패널티 부여
+                        # 위험도(danger_val)의 크기와 상관없이, 위험 구역에 발을 들이면 즉시 고정된 패널티를 부과함.
+                        reward -= 0.5
+
             # 목표 진행도 보상(AVOID 중에도 전진 유도)
             gx, gy = self.waypoints[self.wp_idx] if self.wp_idx < len(self.waypoints) else self.waypoints[-1]
             goal_dist_cells = float(np.hypot(gy - ry, gx - rx))
@@ -1530,6 +1544,14 @@ class DynAvoidOneObjEnv(gym.Env):
                 reward += self.progress_coef * clipped_delta
                 if prog_delta > 1e-6:
                     reward += self.progress_bonus * min(1.0, prog_delta)
+            elif mode == "ESCAPE" and hasattr(self, "trap_center"):
+                # [Escape Mode] Trap 중심에서 멀어질수록 보상 (탈출 유도)
+                dist_from_center = np.linalg.norm(self.agent_rc - self.trap_center)
+                if getattr(self, "prev_dist_from_center", None) is not None:
+                    delta = dist_from_center - self.prev_dist_from_center
+                    # 중심에서 멀어지면(delta > 0) 보상, 가까워지면 패널티
+                    reward += 0.5 * delta 
+                self.prev_dist_from_center = dist_from_center
             
             self._prev_goal_dist_cells = goal_dist_cells
 
@@ -1705,23 +1727,17 @@ class DynAvoidOneObjEnv(gym.Env):
                         self._apply_cpp_path(new_path)
 
         # Danger zone 침범 패널티 (ESCAPE 모드일 땐 종료시키지 않음)
-        skip_danger_penalty = self.use_escape_subpolicy and getattr(self, "escape_active", False)
-        if self.danger_zone_map is not None and not skip_danger_penalty:
-            yy = int(round(self.agent_rc[0]))
-            xx = int(round(self.agent_rc[1]))
-            if 0 <= yy < self.H and 0 <= xx < self.W:
-                sev = float(self.danger_zone_map.soft[yy, xx])
-                if sev >= self.danger_block_threshold:
-                    # 기존: reward -= 2.0; done = True
-                    # 변경: 즉시 종료하지 않고 패널티만 부여(강도를 낮춰 동적 객체 회피를 우선)
-                    reward -= 0.5
-        # ESCAPE 모드일 때: danger에서 벗어나면 추가 보상, 안에 머무르면 소폭 패널티
+        # [Cleanup] 중복 패널티 로직 제거
+        # 위쪽 step() 초반부에서 이미 danger_val > 0.1 일 때 고정 패널티(-0.5)를 부여하고 있음.
+        # 따라서 여기서는 ESCAPE 모드 해제(성공) 보상만 처리하고, 추가적인 패널티는 제거함.
+        
+        # ESCAPE 모드일 때: danger에서 벗어나면 추가 보상
         if self.use_escape_subpolicy and getattr(self, "escape_active", False):
             inside_soft = self._agent_inside_soft_danger()
             if not inside_soft:
-                reward += 1.3  # 탈출 성공 보상 조정 (3.0 -> 1.3)
-            else:
-                reward -= 0.15 # 체류 패널티 강화 (-0.1 -> -0.15)
+                reward += 1.3  # 탈출 성공 보상
+            # else:
+            #     reward -= 0.15 # 중복 패널티 제거 (이미 위에서 -0.5 적용됨)
 
         # 보상 클리핑 폭 확대
         reward = float(np.clip(reward, -5.0, 5.0))
