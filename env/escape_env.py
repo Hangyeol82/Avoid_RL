@@ -13,8 +13,10 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
         # Escape 모드 강제 활성화
         kwargs["use_escape_subpolicy"] = True
         super().__init__(*args, **kwargs)
-        
+        self._cached_trap = None  # [최적화] 위험 구역 맵 캐시
+
     def reset(self, seed=None, options=None):
+        self._cached_trap = None  # 리셋 시 캐시 초기화
         # 1. 기본 초기화 (맵 로드, 동적 객체 스폰 등)
         obs, info = super().reset(seed=seed, options=options)
         
@@ -24,21 +26,65 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
         # 3. 관측 업데이트 (위험 구역 반영)
         return self._obs(), info
 
+    def _rebuild_danger_map(self):
+        """
+        [최적화] 매 스텝 200개의 점을 다시 그리는 것은 낭비이므로,
+        첫 번째 프레임에서 그린 결과를 캐싱해두고 재사용함.
+        """
+        # 캐시가 있으면 그것만 복구하고 끝 (매우 빠름)
+        if self._cached_trap is not None:
+            np.copyto(self.danger_zone_map.soft, self._cached_trap)
+            return
+
+        # 캐시가 없으면(첫 실행) 부모 로직으로 그림
+        super()._rebuild_danger_map()
+        
+        # 그린 결과를 캐시에 저장
+        if self.danger_zone_map is not None:
+            self._cached_trap = self.danger_zone_map.soft.copy()
+
     def _setup_escape_scenario(self):
+        self._cached_trap = None  # 리셋 시 캐시 초기화
         H, W = self.grid.shape
         
-        # (1) 위험 구역을 생성할 중심점 찾기 (빈 공간)
-        cy, cx = 0, 0
-        found = False
-        for _ in range(100):
-            cy = self.rng.integers(5, H - 5)
-            cx = self.rng.integers(5, W - 5)
-            if self.grid[cy, cx] == 0:
-                found = True
-                break
+        # (1) 에이전트와 동적 객체가 모두 안전한(벽이 아닌) 위치 찾기
+        cy, cx = H // 2, W // 2
+        oy, ox = cy + 3.0, cx
         
-        if not found:
-            cy, cx = H // 2, W // 2
+        found_valid_setup = False
+        
+        # 최대 100번 시도하여 적절한 위치 쌍을 찾음
+        for _ in range(100):
+            # 1. 에이전트 위치 (위험 구역 중심) 랜덤 선정
+            t_cy = self.rng.integers(5, H - 5)
+            t_cx = self.rng.integers(5, W - 5)
+            
+            if self.grid[t_cy, t_cx] == 1: # 벽이면 패스
+                continue
+                
+            # 2. 동적 객체 위치 선정 (에이전트 주변 3.0 거리)
+            # 에이전트 위치가 잡히면, 그 주변에서 벽이 아닌 곳을 찾음 (최대 20번 시도)
+            valid_obj = False
+            t_oy, t_ox = 0.0, 0.0
+            
+            for _ in range(20):
+                angle = self.rng.uniform(0, 2 * np.pi)
+                dist = 3.0
+                ty = t_cy + dist * np.sin(angle)
+                tx = t_cx + dist * np.cos(angle)
+                
+                ity, itx = int(ty), int(tx)
+                if 0 <= ity < H and 0 <= itx < W:
+                    if self.grid[ity, itx] == 0: # 벽이 아니면 성공
+                        t_oy, t_ox = ty, tx
+                        valid_obj = True
+                        break
+            
+            if valid_obj:
+                cy, cx = t_cy, t_cx
+                oy, ox = t_oy, t_ox
+                found_valid_setup = True
+                break
 
         # (2) 동적 객체 확보 및 배치
         if not self.dynamic_objs:
@@ -66,13 +112,7 @@ class EscapeTrainingEnv(DynAvoidOneObjEnv):
         # (4) 에이전트를 위험 구역 내부(중심)로 이동
         self.agent_rc = np.array([float(cy), float(cx)], dtype=float)
         
-        # (5) 동적 객체 배치
-        # 사용자의 요청대로 에이전트와 3칸(3.0) 떨어진 위치에 랜덤하게 배치
-        offset_angle = self.rng.uniform(0, 2 * np.pi)
-        offset_dist = 3.0
-        oy = cy + offset_dist * np.sin(offset_angle)
-        ox = cx + offset_dist * np.cos(offset_angle)
-        
+        # (5) 동적 객체 배치 (이미 위에서 계산된 안전한 위치 사용)
         target_obj.p = np.array([oy, ox], dtype=float)
         
         # 객체가 제자리에서 조금씩 움직이게 하여(배회) 계속 위협을 줌
