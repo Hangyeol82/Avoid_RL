@@ -97,6 +97,7 @@ class DynAvoidOneObjEnv(gym.Env):
         self.prev_obj_dist_m: Optional[float] = None
         self.prev_agent_rc: Optional[np.ndarray] = self.agent_rc.copy()
         self.avoiding: bool = False
+        self._safe_bonus_given: bool = False
         self.visited: Optional[np.ndarray] = np.zeros(len(self.waypoints), dtype=bool)
         self.dynamic_objs: List[MovingObj] = []
 
@@ -1316,6 +1317,7 @@ class DynAvoidOneObjEnv(gym.Env):
         self.goal_stagnation_timer = 0
 
         self._prev_goal_dist_cells = None
+        self._safe_bonus_given = False
 
         return self._obs(), {}
 
@@ -1435,6 +1437,7 @@ class DynAvoidOneObjEnv(gym.Env):
             mode = "ESCAPE"
         info["mode"] = mode
         info["override_active"] = bool(self.override_path)
+        entered_avoid = (mode == "AVOID" and not self.avoiding)
 
         executed_action = 4  # 정지(로깅)
 
@@ -1466,6 +1469,8 @@ class DynAvoidOneObjEnv(gym.Env):
 
         # ---------------- AVOID ----------------
         else:
+            if entered_avoid:
+                self._safe_bonus_given = False
             self.avoiding = True
             moved_successfully = True
             if action_from_ppo is not None:
@@ -1530,6 +1535,14 @@ class DynAvoidOneObjEnv(gym.Env):
                         # [Fixed Penalty] 위험 구역 진입 시 고정 패널티 부여
                         # 위험도(danger_val)의 크기와 상관없이, 위험 구역에 발을 들이면 즉시 고정된 패널티를 부과함.
                         reward -= 0.5
+
+            # 안전 거리 확보 즉시 보너스 (다음 스텝을 기다리지 않고 AVOID 종료를 유도)
+            dist_after_m = self._distance_to_nearest_obj_m(visible_only=self.consider_occlusion_in_mode)
+            dist_after_cells = dist_after_m / self.cell_size_m if np.isfinite(dist_after_m) else float("inf")
+            if (not self._safe_bonus_given) and np.isfinite(dist_after_cells) and dist_after_cells >= SAFE:
+                reward += 0.2
+                self._safe_bonus_given = True
+                self.avoiding = False
 
             # 목표 진행도 보상(AVOID 중에도 전진 유도)
             gx, gy = self.waypoints[self.wp_idx] if self.wp_idx < len(self.waypoints) else self.waypoints[-1]

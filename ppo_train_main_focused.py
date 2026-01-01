@@ -18,15 +18,11 @@ from rl.vec_env import SubprocVecEnv, CloudpickleWrapper
 # =============================================================================
 #  전이학습 설정: 불러올 모델 경로 (없으면 None)
 # =============================================================================
-PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_dyn/ppo_dyn_iter500.pt"
+PRETRAINED_MODEL_PATH: Optional[str] = "checkpoints_integrated_random/main_iter800.pt"
 # =============================================================================
 """
-python ppo_train_main_focused.py ^
-  --total-iters 50000 ^
-  --regen-every 50 ^
-  --map-size 30 ^
-  --focused-prob 0.3 ^
-  --num-envs 6
+& "C:/Users/kingn/OneDrive/Desktop/Mower/Avoid_RL/.venv/Scripts/python.exe" ppo_train_main_focused.py --total-iters 3000 --regen-every 10 --map-size 30 --focused-prob 0.3 --num-envs 6
+
 """
 
 # ------------------------------ 커리큘럼 ------------------------------ #
@@ -219,8 +215,7 @@ def make_spawn_fn(obj_k: int, type_probs: Dict[str, float]):
                         (min(H - 2, sy + 3), min(W - 2, sx + 3)),
                         (min(H - 2, sy + 3), sx),
                     ]
-                    pts = [(py, px) for (py, px) in cand if 0 <= py < H and 0 <= px < W and occ_grid[py, px] == 0:
-                            pts.append((py, px))]
+                    pts = [(py, px) for (py, px) in cand if 0 <= py < H and 0 <= px < W and occ_grid[py, px] == 0]
 
                 if len(pts) >= 2:
                     obj.set_patrol([(float(py), float(px)) for (py, px) in pts])
@@ -341,12 +336,12 @@ def main():
         gae_lambda=0.95,
         device=device,
         seed=0,
-        hidden_sizes=(512,512,256),
-        feat_dim=384
+        hidden_sizes=(256,256,128),
+        feat_dim=256
     )
 
     # [변경] PPOTrainerMulti 사용
-    trainer = PPOTrainerMulti(vec_env, cfg, device=device)
+    trainer = PPOTrainerMulti(vec_env, cfg)
 
     # 전이학습 로드
     if PRETRAINED_MODEL_PATH and os.path.exists(PRETRAINED_MODEL_PATH):
@@ -374,13 +369,13 @@ def main():
     # 초기 스폰 정책(커리큘럼 1 iter 적용)
     init_k, init_probs, _ = curriculum(1, total_iters)
     spawn_fn = make_spawn_fn(init_k, init_probs)
-    vec_env.set_attr("_default_spawn", CloudpickleWrapper(spawn_fn))
+    vec_env.set_attr("_default_spawn", spawn_fn)
 
     for it in range(1, total_iters + 1):
         # === 커리큘럼 적용: iter마다 스폰 정책 갱신 ===
         obj_k, type_probs, _easy = curriculum(it, total_iters)
         spawn_fn = make_spawn_fn(obj_k, type_probs)
-        vec_env.set_attr("_default_spawn", CloudpickleWrapper(spawn_fn))
+        vec_env.set_attr("_default_spawn", spawn_fn)
 
         # 주기적으로 맵/웨이포인트 재생성
         if it % regen_every == 0:
@@ -396,7 +391,7 @@ def main():
                 vec_env = SubprocVecEnv(env_fns)
 
                 # 새 환경에도 커리큘럼 스폰 정책 주입
-                vec_env.set_attr("_default_spawn", CloudpickleWrapper(spawn_fn))
+                vec_env.set_attr("_default_spawn", spawn_fn)
 
                 # 트레이너에 새 환경 연결 및 관측 초기화
                 trainer.env = vec_env
