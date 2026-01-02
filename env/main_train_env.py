@@ -16,6 +16,8 @@ class MainTrainingEnv(DynAvoidOneObjEnv):
         super().__init__(*args, **kwargs)
         self.focused_mode = False
         self.success_counter = 0
+        self._focused_post_safe_steps = 0
+        self._focused_safe_bonus_given = False
 
     def reset(self, seed=None, options=None):
         # 1. 기본 초기화
@@ -24,6 +26,8 @@ class MainTrainingEnv(DynAvoidOneObjEnv):
         # 2. 확률적으로 회피 시나리오 모드 진입
         self.focused_mode = False
         self.success_counter = 0
+        self._focused_post_safe_steps = 0
+        self._focused_safe_bonus_given = False
         if self.focused_training_prob > 0.0 and self.rng.random() < self.focused_training_prob:
             self._setup_avoid_scenario()
             self.focused_mode = True
@@ -90,26 +94,25 @@ class MainTrainingEnv(DynAvoidOneObjEnv):
         obs, reward, done, trunc, info = super().step(action)
         
         # [Focused Mode 전용 종료 조건]
-        # 회피 시나리오에서는 '위험 상황을 벗어나면' 즉시 에피소드를 종료시킴.
-        # 이를 통해 "위험 -> 회피 -> 다시 위험 -> 보상 파밍" 루프를 원천 차단함.
+        # 회피 성공 후 바로 끝내지 않고, SAFE 유지가 연속 4스텝 되면 종료
         if self.focused_mode and not done:
-            # 너무 빨리 끝나는 것 방지 (최소 20스텝)
-            if self.steps > 20:
-                dist_to_obj_cells = self._distance_to_nearest_obj_cells()
-                
-                # 안전 거리(SAFE) 밖으로 벗어났다면 성공 카운트 증가
-                if dist_to_obj_cells >= self.safe_cells:
-                    self.success_counter += 1
-                else:
-                    self.success_counter = 0
-                
-                # 3스텝 이상 연속으로 안전해야 진짜 성공으로 인정 (찍먹 방지)
-                if self.success_counter >= 3:
+            # AVOID가 다시 켜지면 카운터 초기화
+            if info.get("mode", "") == "AVOID":
+                self._focused_post_safe_steps = 0
+
+            dist_to_obj_cells = self._distance_to_nearest_obj_cells()
+
+            if self.steps > 20 and np.isfinite(dist_to_obj_cells) and dist_to_obj_cells >= self.safe_cells:
+                # SAFE 도달 시 보너스는 한 번만 지급
+                if not self._focused_safe_bonus_given:
+                    reward += 0.3
+                    self._focused_safe_bonus_given = True
+                self._focused_post_safe_steps += 1
+                if self._focused_post_safe_steps >= 4:
                     done = True
-                    reward += 0.3  # 성공 보상 (기존 2.0 -> 0.3 하향)
-                    # 너무 큰 보상은 '회피' 자체에만 집중하게 하여 '목표 지점 이동'을 소홀히 할 수 있음.
-                    # 따라서 적절한 수준의 보상만 지급하여 '똑똑한 회피(목표로 가면서 피하기)'를 유도함.
                     info["finish_reason"] = "focused_training_success"
+            else:
+                self._focused_post_safe_steps = 0
         
         return obs, reward, done, trunc, info
 

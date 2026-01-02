@@ -150,7 +150,7 @@ class DynAvoidOneObjEnv(gym.Env):
         # ====== 모드 전환 임계(칸 단위) ======
         self.collision_cells = 0.75
         self.danger_cells    = 5.0
-        self.safe_cells      = 7.0
+        self.safe_cells      = 5.0
 
         # 모드 전환 시 가림막 고려 여부
         self.consider_occlusion_in_obs  = bool(consider_occlusion_in_obs)
